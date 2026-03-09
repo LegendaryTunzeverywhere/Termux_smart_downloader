@@ -1,11 +1,10 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # ============================================================
 #  Termux Smart Downloader
-#  Shared via: Settings > Share > Termux
 #  Usage: termux-downloader.sh [URL]
 # ============================================================
 
-# ── Colors ──────────────────────────────────────────────────
+# ── Colors ───────────────────────────────────────────────────
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -22,6 +21,12 @@ VIDEO_DIR="$DOWNLOAD_DIR/Video"
 IMAGE_DIR="$DOWNLOAD_DIR/Images"
 FILE_DIR="$DOWNLOAD_DIR/Files"
 TEMP_DIR="$DOWNLOAD_DIR/.tmp"
+
+# Summary tracking — populated during the session
+SUMMARY_FILE=""
+SUMMARY_COMPRESSED=""
+SUMMARY_TYPE=""
+SUMMARY_START_TIME=""
 
 # ── Helpers ──────────────────────────────────────────────────
 print_banner() {
@@ -63,22 +68,45 @@ check_deps() {
   if [[ ${#missing[@]} -gt 0 ]]; then
     warn "Missing tools: ${missing[*]}"
     confirm "Install missing packages now?" || { error "Cannot continue without required tools."; exit 1; }
-    pkg update -y
+    spinner_start "Updating package lists"
+    pkg update -y &>/dev/null
+    spinner_stop "Package lists updated"
     for tool in "${missing[@]}"; do
       case "$tool" in
         yt-dlp)
           if command -v pip &>/dev/null; then
-            pip install -U yt-dlp
+            spinner_start "Installing yt-dlp"
+            pip install -U yt-dlp &>/dev/null
+            spinner_stop "yt-dlp installed"
           else
-            warn "pip not found. Installing python first..."
-            pkg install -y python
-            pip install -U yt-dlp
+            spinner_start "Installing python"
+            pkg install -y python &>/dev/null
+            spinner_stop "Python installed"
+            spinner_start "Installing yt-dlp"
+            pip install -U yt-dlp &>/dev/null
+            spinner_stop "yt-dlp installed"
           fi
           ;;
-        ffmpeg) pkg install -y ffmpeg ;;
-        curl)   pkg install -y curl   ;;
-        wget)   pkg install -y wget   ;;
-        bc)     pkg install -y bc     ;;
+        ffmpeg)
+          spinner_start "Installing ffmpeg"
+          pkg install -y ffmpeg &>/dev/null
+          spinner_stop "ffmpeg installed"
+          ;;
+        curl)
+          spinner_start "Installing curl"
+          pkg install -y curl &>/dev/null
+          spinner_stop "curl installed"
+          ;;
+        wget)
+          spinner_start "Installing wget"
+          pkg install -y wget &>/dev/null
+          spinner_stop "wget installed"
+          ;;
+        bc)
+          spinner_start "Installing bc"
+          pkg install -y bc &>/dev/null
+          spinner_stop "bc installed"
+          ;;
       esac
     done
   fi
@@ -101,9 +129,49 @@ human_size() {
   fi
 }
 
-# ── Progress Utilities ────────────────────────────────────────
+elapsed_time() {
+  local secs=$(( $(date +%s) - SUMMARY_START_TIME ))
+  if [[ $secs -lt 60 ]]; then
+    echo "${secs}s"
+  else
+    echo "$(( secs/60 ))m $(( secs%60 ))s"
+  fi
+}
 
-# Spinner — used for near-instant operations (image compress, format fetch)
+# ── Summary Screen ────────────────────────────────────────────
+print_summary() {
+  local elapsed
+  elapsed=$(elapsed_time)
+
+  echo ""
+  echo -e "${CYAN}${BOLD}╔══════════════════════════════════════╗${RESET}"
+  echo -e "${CYAN}${BOLD}║           Download Summary           ║${RESET}"
+  echo -e "${CYAN}${BOLD}╚══════════════════════════════════════╝${RESET}"
+  echo ""
+  echo -e "  ${BOLD}Type:${RESET}       $SUMMARY_TYPE"
+
+  if [[ -n "$SUMMARY_FILE" && -f "$SUMMARY_FILE" ]]; then
+    echo -e "  ${BOLD}File:${RESET}       $(basename "$SUMMARY_FILE")"
+    echo -e "  ${BOLD}Size:${RESET}       $(human_size "$SUMMARY_FILE")"
+    echo -e "  ${BOLD}Saved to:${RESET}   $(dirname "$SUMMARY_FILE")"
+  elif [[ -n "$SUMMARY_FILE" ]]; then
+    echo -e "  ${BOLD}Saved to:${RESET}   $SUMMARY_FILE"
+  fi
+
+  if [[ -n "$SUMMARY_COMPRESSED" && -f "$SUMMARY_COMPRESSED" ]]; then
+    echo -e "  ${BOLD}Compressed:${RESET} $(basename "$SUMMARY_COMPRESSED") ($(human_size "$SUMMARY_COMPRESSED"))"
+  fi
+
+  echo -e "  ${BOLD}Duration:${RESET}   $elapsed"
+  echo ""
+  echo -e "${GREEN}${BOLD}  ✔ All done!${RESET}"
+  echo ""
+  echo -e "${BLUE}──────────────────────────────────────────${RESET}"
+  echo -ne "  Press ${BOLD}[Enter]${RESET} to close... " >/dev/tty
+  read -r </dev/tty
+}
+
+# ── Progress Utilities ────────────────────────────────────────
 SPINNER_PID=""
 
 spinner_start() {
@@ -132,36 +200,27 @@ spinner_stop() {
   success "$label"
 }
 
-# Draw a [████░░░] bar — called by ffmpeg_progress loop
-# Usage: draw_bar <percent 0-100> <label>
 draw_bar() {
   local pct="$1"
   local label="$2"
   local width=30
   local filled=$(( pct * width / 100 ))
   local empty=$(( width - filled ))
-  local bar=""
-  local i
+  local bar="" i
   for (( i=0; i<filled; i++ )); do bar+="█"; done
   for (( i=0; i<empty;  i++ )); do bar+="░"; done
   printf "\r  ${CYAN}[%s]${RESET} ${BOLD}%3d%%${RESET}  %s" "$bar" "$pct" "$label" >/dev/tty
 }
 
-# ffmpeg with a live percentage bar.
-# Usage: ffmpeg_progress <duration_seconds> <label> <output_file> <ffmpeg_args...>
-# The output file must NOT be in ffmpeg_args — it is appended here so we can
-# inject -progress and -y cleanly.
 ffmpeg_progress() {
   local duration_s="$1"
   local label="$2"
   local output_file="$3"
   shift 3
-  # remaining args = all ffmpeg flags except -y and the output path
 
   local progress_pipe="$TEMP_DIR/.ffprogress_$$"
   rm -f "$progress_pipe"
 
-  # Run ffmpeg in background; -progress writes machine-readable key=value lines
   ffmpeg "$@" \
     -progress "$progress_pipe" \
     -nostats -loglevel error \
@@ -173,11 +232,9 @@ ffmpeg_progress() {
   local pct=0
   while kill -0 "$ffmpeg_pid" 2>/dev/null; do
     if [[ -f "$progress_pipe" ]]; then
-      # out_time_us = microseconds of encoded output so far
       local out_us
       out_us=$(grep '^out_time_us=' "$progress_pipe" 2>/dev/null | tail -1 | cut -d= -f2)
       if [[ -n "$out_us" && "$out_us" =~ ^[0-9]+$ && "$duration_s" -gt 0 ]]; then
-        # convert µs → centiseconds, divide by duration in centiseconds → %
         pct=$(( out_us / 10000 / duration_s ))
         [[ $pct -gt 100 ]] && pct=100
         draw_bar "$pct" "$label"
@@ -199,7 +256,6 @@ ffmpeg_progress() {
   return $exit_code
 }
 
-# Probe media duration in whole seconds; returns 1 on failure (avoids div/0)
 get_duration() {
   local file="$1"
   local d
@@ -234,12 +290,12 @@ compress_audio() {
   local duration
   duration=$(get_duration "$input")
 
-  info "Compressing audio → ${bitrate}..."
   ffmpeg_progress "$duration" "Compressing audio" "$output" \
     -i "$input" -b:a "$bitrate"
 
   if [[ $? -eq 0 ]]; then
     success "Compressed: $output ($(human_size "$output"))"
+    SUMMARY_COMPRESSED="$output"
     if confirm "Delete original uncompressed file?"; then
       rm -f "$input"
       success "Original deleted."
@@ -282,6 +338,7 @@ compress_video() {
         -maxrate "${bitrate}k" -b:a 128k
       if [[ $? -eq 0 ]]; then
         success "Compressed: $output ($(human_size "$output"))"
+        SUMMARY_COMPRESSED="$output"
         if confirm "Delete original?"; then rm -f "$input"; fi
       else
         error "Compression failed."
@@ -291,13 +348,13 @@ compress_video() {
     *) warn "Invalid choice, skipping compression."; return ;;
   esac
 
-  info "Compressing video (CRF=$crf)..."
   ffmpeg_progress "$duration" "Compressing video" "$output" \
     -i "$input" -vcodec libx264 -crf "$crf" -preset fast \
     -acodec aac -b:a 128k
 
   if [[ $? -eq 0 ]]; then
     success "Compressed: $output ($(human_size "$output"))"
+    SUMMARY_COMPRESSED="$output"
     if confirm "Delete original?"; then rm -f "$input"; fi
   else
     error "Compression failed."
@@ -325,8 +382,6 @@ compress_image() {
     *) warn "Invalid choice, skipping compression."; return ;;
   esac
 
-  # Images compress in under a second — spinner is more appropriate than a bar
-  info "Compressing image (quality=$quality)..."
   spinner_start "Compressing image"
   ffmpeg -i "$input" -q:v "$quality" -y "$output" 2>/dev/null
   local exit_code=$?
@@ -334,6 +389,7 @@ compress_image() {
 
   if [[ $exit_code -eq 0 ]]; then
     success "Saved: $output ($(human_size "$output"))"
+    SUMMARY_COMPRESSED="$output"
     if confirm "Delete original?"; then rm -f "$input"; fi
   else
     error "Compression failed."
@@ -345,6 +401,7 @@ compress_image() {
 download_audio() {
   local url="$1"
   print_section "Audio Download"
+  SUMMARY_TYPE="🎵 Audio"
 
   echo -e "  ${BOLD}Format:${RESET}"
   echo -e "  ${BOLD}1)${RESET} MP3"
@@ -385,9 +442,6 @@ download_audio() {
   info "Downloading audio as ${fmt^^}..."
   echo ""
 
-  # yt-dlp has a rich built-in progress display; --newline keeps each update
-  # on its own line which works best in Termux (no ANSI cursor tricks needed).
-  # We capture the final saved path via --print after_move:filepath.
   local out_file
   out_file=$(yt-dlp \
     --extract-audio \
@@ -398,19 +452,19 @@ download_audio() {
     --newline \
     "$url" 2>&1 | tee /dev/tty | grep -v '^\[' | grep -v '^$' | tail -1)
 
-  # Strip ANSI escape codes and whitespace from captured path
   out_file=$(printf '%s' "$out_file" | sed 's/\x1b\[[0-9;]*[mK]//g' | tr -d '\r' | xargs 2>/dev/null)
 
   echo ""
   if [[ -f "$out_file" ]]; then
+    SUMMARY_FILE="$out_file"
     success "Saved: $out_file ($(human_size "$out_file"))"
     if confirm "Compress this audio file?"; then
       compress_audio "$out_file"
     fi
   else
-    # Fallback: find the newest matching file created after our marker
     out_file=$(find "$AUDIO_DIR" -name "*.${fmt}" -newer "$TEMP_DIR/.marker" 2>/dev/null | head -1)
     if [[ -f "$out_file" ]]; then
+      SUMMARY_FILE="$out_file"
       success "Saved: $out_file ($(human_size "$out_file"))"
       if confirm "Compress this audio file?"; then
         compress_audio "$out_file"
@@ -424,8 +478,8 @@ download_audio() {
 download_video() {
   local url="$1"
   print_section "Video Download"
+  SUMMARY_TYPE="🎬 Video"
 
-  # Spinner while fetching format list (network call, unknown duration)
   spinner_start "Fetching available formats"
   local fmt_list
   fmt_list=$(yt-dlp -F "$url" 2>/dev/null)
@@ -442,7 +496,7 @@ download_video() {
   echo -e "  ${BOLD}4)${RESET} 480p"
   echo -e "  ${BOLD}5)${RESET} 360p"
   echo -e "  ${BOLD}6)${RESET} Audio only (best)"
-  echo -e "  ${BOLD}7)${RESET} Enter format code manually (from list above)"
+  echo -e "  ${BOLD}7)${RESET} Enter format code manually"
   ask "Choose quality [1-7]:"
   local q_choice="$REPLY"
 
@@ -482,7 +536,6 @@ download_video() {
   echo ""
   touch "$TEMP_DIR/.marker"
 
-  # yt-dlp's native progress display; --newline = one update per line (Termux-safe)
   yt-dlp \
     -f "$format_arg" \
     "${merge_args[@]}" \
@@ -496,6 +549,7 @@ download_video() {
   out_file=$(find "$VIDEO_DIR" -newer "$TEMP_DIR/.marker" -type f 2>/dev/null | head -1)
 
   if [[ $exit_code -eq 0 && -f "$out_file" ]]; then
+    SUMMARY_FILE="$out_file"
     success "Saved: $out_file ($(human_size "$out_file"))"
     if confirm "Compress this video?"; then
       compress_video "$out_file"
@@ -508,6 +562,7 @@ download_video() {
 download_image() {
   local url="$1"
   print_section "Image Download"
+  SUMMARY_TYPE="🖼️  Image"
 
   local is_gallery=false
   if echo "$url" | grep -qiE "instagram|pinterest|flickr|reddit|imgur|twitter|x\.com|tumblr|500px"; then
@@ -550,6 +605,7 @@ download_image() {
       local out_file
       out_file=$(find "$IMAGE_DIR" -newer "$TEMP_DIR/.marker" -type f 2>/dev/null | head -1)
       if [[ -f "$out_file" ]]; then
+        SUMMARY_FILE="$IMAGE_DIR"
         success "Images saved to: $IMAGE_DIR"
         if confirm "Compress downloaded images?"; then
           find "$IMAGE_DIR" -newer "$TEMP_DIR/.marker" -type f \
@@ -565,7 +621,6 @@ download_image() {
     fi
   fi
 
-  # Direct image URL — curl's --progress-bar gives a native ASCII bar
   local filename
   filename=$(basename "$url" | sed 's/[?#].*//')
   local ext="${filename##*.}"
@@ -577,11 +632,11 @@ download_image() {
   echo -e "  Direct image download → ${BOLD}$filename${RESET}"
   echo ""
   info "Downloading image..."
-  # --progress-bar = native curl progress bar (####    )
   curl -L --progress-bar -o "$IMAGE_DIR/$filename" "$url"
 
   if [[ $? -eq 0 && -f "$IMAGE_DIR/$filename" ]]; then
     echo ""
+    SUMMARY_FILE="$IMAGE_DIR/$filename"
     success "Saved: $IMAGE_DIR/$filename ($(human_size "$IMAGE_DIR/$filename"))"
     if confirm "Compress this image?"; then
       compress_image "$IMAGE_DIR/$filename"
@@ -594,6 +649,7 @@ download_image() {
 download_file() {
   local url="$1"
   print_section "File Download"
+  SUMMARY_TYPE="📁 File"
 
   ask "Save filename (leave blank for auto-detect):"
   local filename="$REPLY"
@@ -614,17 +670,14 @@ download_file() {
   case "$tool_choice" in
     1)
       info "Downloading with curl..."
-      # --progress-bar = native curl [####    ] bar
       curl -L --progress-bar -C - -o "$out_path" "$url"
       ;;
     2)
       info "Downloading with wget..."
-      # --show-progress = native wget progress bar
       wget -c --show-progress -O "$out_path" "$url"
       ;;
     3)
       info "Downloading with yt-dlp..."
-      # --newline keeps each progress update on its own line (Termux-safe)
       yt-dlp --output "$FILE_DIR/%(title)s.%(ext)s" --newline "$url"
       ;;
     *)
@@ -639,6 +692,7 @@ download_file() {
   if [[ $dl_exit -eq 0 ]]; then
     success "Download complete!"
     if [[ -f "$out_path" ]]; then
+      SUMMARY_FILE="$out_path"
       info "Saved: $out_path ($(human_size "$out_path"))"
       local ext="${filename##*.}"
       if echo "$ext" | grep -qiE "^(mp4|mkv|avi|mov|webm|flv)$"; then
@@ -676,6 +730,12 @@ main() {
   make_dirs
   check_deps
 
+  # Reset summary tracking for this run
+  SUMMARY_FILE=""
+  SUMMARY_COMPRESSED=""
+  SUMMARY_TYPE=""
+  SUMMARY_START_TIME=$(date +%s)
+
   echo ""
   print_section "What would you like to download?"
   echo -e "  ${BOLD}1)${RESET} 🎵  Audio       (MP3, M4A, FLAC, etc.)"
@@ -698,11 +758,8 @@ main() {
       ;;
   esac
 
-  echo ""
-  echo -e "${GREEN}${BOLD}═══════════════════════════════════════${RESET}"
-  success "All done! Files saved under: $DOWNLOAD_DIR"
-  echo -e "${GREEN}${BOLD}═══════════════════════════════════════${RESET}"
-  echo ""
+  # Show summary and wait for keypress before closing
+  print_summary
 }
 
 main "$@"
