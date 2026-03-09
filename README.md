@@ -35,7 +35,7 @@ A powerful, interactive Bash script for **Termux on Android** that lets you down
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/Legendarytunzeveywhere/termux-smart-downloader.git
+git clone https://github.com/LegendaryTunzeverywhere/Termux_smart_downloader.git
 cd termux-smart-downloader
 ```
 
