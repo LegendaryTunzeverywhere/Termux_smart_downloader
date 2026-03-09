@@ -41,23 +41,29 @@ warn()    { echo -e "${YELLOW}⚠ $1${RESET}"; }
 error()   { echo -e "${RED}✖ $1${RESET}"; }
 info()    { echo -e "${CYAN}ℹ $1${RESET}"; }
 
+# FIX BUG 1 & 2: ask() was called inside $() subshells, causing 'read' to
+# receive no input (reads from closed stdin in subshell). Fixed by writing
+# the answer to a global variable directly — no subshell involved.
 ask() {
-  echo -ne "${MAGENTA}${BOLD}$1${RESET} "
-  read -r REPLY
-  echo "$REPLY"
+  echo -ne "${MAGENTA}${BOLD}$1${RESET} " >/dev/tty
+  read -r REPLY </dev/tty
+  # REPLY is now a global variable — callers must read $REPLY directly
 }
 
+# FIX BUG 2: confirm() called ask() inside $(), so 'ans' was always empty
+# and confirm always returned false. Fixed to read $REPLY after ask().
 confirm() {
-  # confirm "message" → returns 0 for yes, 1 for no
-  local ans
-  ans=$(ask "$1 [y/N]:")
-  [[ "$ans" =~ ^[Yy]$ ]]
+  ask "$1 [y/N]:"
+  [[ "$REPLY" =~ ^[Yy]$ ]]
 }
 
 make_dirs() {
   mkdir -p "$AUDIO_DIR" "$VIDEO_DIR" "$IMAGE_DIR" "$FILE_DIR" "$TEMP_DIR"
 }
 
+# FIX BUG 6: Loop variable named 'pkg' shadowed the Termux 'pkg' binary,
+# breaking all 'pkg install' calls. Renamed loop variable to 'tool'.
+# FIX BUG 10: Added check for pip before attempting 'pip install yt-dlp'.
 check_deps() {
   local missing=()
   for cmd in yt-dlp ffmpeg curl wget; do
@@ -65,20 +71,24 @@ check_deps() {
   done
   if [[ ${#missing[@]} -gt 0 ]]; then
     warn "Missing tools: ${missing[*]}"
-    if confirm "Install missing packages now?"; then
-      pkg update -y
-      for pkg in "${missing[@]}"; do
-        case "$pkg" in
-          yt-dlp) pip install -U yt-dlp ;;
-          ffmpeg) pkg install -y ffmpeg ;;
-          curl)   pkg install -y curl ;;
-          wget)   pkg install -y wget ;;
-        esac
-      done
-    else
-      error "Cannot continue without required tools."
-      exit 1
-    fi
+    confirm "Install missing packages now?" || { error "Cannot continue without required tools."; exit 1; }
+    pkg update -y
+    for tool in "${missing[@]}"; do
+      case "$tool" in
+        yt-dlp)
+          if command -v pip &>/dev/null; then
+            pip install -U yt-dlp
+          else
+            warn "pip not found. Installing python first..."
+            pkg install -y python
+            pip install -U yt-dlp
+          fi
+          ;;
+        ffmpeg) pkg install -y ffmpeg ;;
+        curl)   pkg install -y curl   ;;
+        wget)   pkg install -y wget   ;;
+      esac
+    done
   fi
 }
 
@@ -109,15 +119,15 @@ compress_audio() {
   echo -e "  ${BOLD}2)${RESET} Medium quality (~128k — balanced)"
   echo -e "  ${BOLD}3)${RESET} High quality   (~192k — larger)"
   echo -e "  ${BOLD}4)${RESET} Custom bitrate"
-  local choice
-  choice=$(ask "Choose compression level [1-4]:")
+  ask "Choose compression level [1-4]:"
+  local choice="$REPLY"
 
   local bitrate
   case "$choice" in
     1) bitrate="64k"  ;;
     2) bitrate="128k" ;;
     3) bitrate="192k" ;;
-    4) bitrate=$(ask "Enter bitrate (e.g. 96k):") ;;
+    4) ask "Enter bitrate (e.g. 96k):"; bitrate="$REPLY" ;;
     *) warn "Invalid choice, skipping compression."; return ;;
   esac
 
@@ -143,8 +153,8 @@ compress_video() {
   echo -e "  ${BOLD}3)${RESET} High quality   (CRF 22 — larger file)"
   echo -e "  ${BOLD}4)${RESET} Custom CRF value (18=best, 51=worst)"
   echo -e "  ${BOLD}5)${RESET} Target file size (MB)"
-  local choice
-  choice=$(ask "Choose compression level [1-5]:")
+  ask "Choose compression level [1-5]:"
+  local choice="$REPLY"
 
   local output="${input%.*}_compressed.mp4"
   local crf
@@ -153,18 +163,20 @@ compress_video() {
     1) crf=35 ;;
     2) crf=28 ;;
     3) crf=22 ;;
-    4) crf=$(ask "Enter CRF value [18-51]:") ;;
+    4) ask "Enter CRF value [18-51]:"; crf="$REPLY" ;;
     5)
-      local target_mb
-      target_mb=$(ask "Target size in MB:")
+      ask "Target size in MB:"; local target_mb="$REPLY"
       local duration
       duration=$(ffprobe -v error -show_entries format=duration \
         -of default=noprint_wrappers=1:nokey=1 "$input" 2>/dev/null)
+      # FIX BUG 9: Subtract audio bitrate (128k) from total to avoid
+      # exceeding target size. Formula: ((MB*8192) / duration) - audio_kbps
       local bitrate
-      bitrate=$(echo "scale=0; ($target_mb * 8192) / $duration" | bc)
-      info "Targeting ~${target_mb}MB with bitrate ${bitrate}k..."
+      bitrate=$(echo "scale=0; ($target_mb * 8192) / $duration - 128" | bc)
+      [[ "$bitrate" -lt 100 ]] && bitrate=100  # floor to avoid unusable bitrate
+      info "Targeting ~${target_mb}MB with video bitrate ${bitrate}k + 128k audio..."
       ffmpeg -i "$input" -b:v "${bitrate}k" -bufsize "${bitrate}k" \
-        -maxrate "${bitrate}k" -y "$output" 2>/dev/null
+        -maxrate "${bitrate}k" -b:a 128k -y "$output" 2>/dev/null
       if [[ $? -eq 0 ]]; then
         success "Compressed: $output ($(human_size "$output"))"
         if confirm "Delete original?"; then rm -f "$input"; fi
@@ -189,7 +201,6 @@ compress_video() {
 
 compress_image() {
   local input="$1"
-  local ext="${input##*.}"
   local output="${input%.*}_compressed.jpg"
 
   print_section "Image Compression"
@@ -197,15 +208,15 @@ compress_image() {
   echo -e "  ${BOLD}2)${RESET} Medium quality (quality 65 — balanced)"
   echo -e "  ${BOLD}3)${RESET} High quality   (quality 85 — larger)"
   echo -e "  ${BOLD}4)${RESET} Custom quality [1-100]"
-  local choice
-  choice=$(ask "Choose compression level [1-4]:")
+  ask "Choose compression level [1-4]:"
+  local choice="$REPLY"
 
   local quality
   case "$choice" in
     1) quality=40 ;;
     2) quality=65 ;;
     3) quality=85 ;;
-    4) quality=$(ask "Enter quality [1-100]:") ;;
+    4) ask "Enter quality [1-100]:"; quality="$REPLY" ;;
     *) warn "Invalid choice, skipping compression."; return ;;
   esac
 
@@ -231,8 +242,8 @@ download_audio() {
   echo -e "  ${BOLD}3)${RESET} OPUS"
   echo -e "  ${BOLD}4)${RESET} WAV"
   echo -e "  ${BOLD}5)${RESET} FLAC"
-  local fmt_choice
-  fmt_choice=$(ask "Choose format [1-5]:")
+  ask "Choose format [1-5]:"
+  local fmt_choice="$REPLY"
   local fmt
   case "$fmt_choice" in
     1) fmt="mp3"  ;;
@@ -249,8 +260,8 @@ download_audio() {
   echo -e "  ${BOLD}2)${RESET} High   (~192kbps)"
   echo -e "  ${BOLD}3)${RESET} Medium (~128kbps)"
   echo -e "  ${BOLD}4)${RESET} Low    (~64kbps)"
-  local q_choice
-  q_choice=$(ask "Choose quality [1-4]:")
+  ask "Choose quality [1-4]:"
+  local q_choice="$REPLY"
   local quality_arg
   case "$q_choice" in
     1) quality_arg="0" ;;
@@ -259,6 +270,10 @@ download_audio() {
     4) quality_arg="7" ;;
     *) quality_arg="0" ;;
   esac
+
+  # FIX BUG 3 (audio side): Create marker file before download so the
+  # fallback find uses .marker (not the directory itself) for -newer comparison.
+  touch "$TEMP_DIR/.marker"
 
   info "Downloading audio as ${fmt}..."
   local out_file
@@ -276,8 +291,8 @@ download_audio() {
       compress_audio "$out_file"
     fi
   else
-    # fallback: find the most recently modified file
-    out_file=$(find "$AUDIO_DIR" -name "*.${fmt}" -newer "$TEMP_DIR" 2>/dev/null | head -1)
+    # FIX BUG 3: Was using "$TEMP_DIR" (directory) instead of "$TEMP_DIR/.marker"
+    out_file=$(find "$AUDIO_DIR" -name "*.${fmt}" -newer "$TEMP_DIR/.marker" 2>/dev/null | head -1)
     if [[ -f "$out_file" ]]; then
       success "Saved: $out_file ($(human_size "$out_file"))"
       if confirm "Compress this audio file?"; then
@@ -306,18 +321,18 @@ download_video() {
   echo -e "  ${BOLD}5)${RESET} 360p"
   echo -e "  ${BOLD}6)${RESET} Audio only (best)"
   echo -e "  ${BOLD}7)${RESET} Enter format code manually (from list above)"
-  local q_choice
-  q_choice=$(ask "Choose quality [1-7]:")
+  ask "Choose quality [1-7]:"
+  local q_choice="$REPLY"
 
   local format_arg
   case "$q_choice" in
     1) format_arg="bestvideo+bestaudio/best" ;;
     2) format_arg="bestvideo[height<=1080]+bestaudio/best[height<=1080]" ;;
-    3) format_arg="bestvideo[height<=720]+bestaudio/best[height<=720]" ;;
-    4) format_arg="bestvideo[height<=480]+bestaudio/best[height<=480]" ;;
-    5) format_arg="bestvideo[height<=360]+bestaudio/best[height<=360]" ;;
+    3) format_arg="bestvideo[height<=720]+bestaudio/best[height<=720]"   ;;
+    4) format_arg="bestvideo[height<=480]+bestaudio/best[height<=480]"   ;;
+    5) format_arg="bestvideo[height<=360]+bestaudio/best[height<=360]"   ;;
     6) format_arg="bestaudio" ;;
-    7) format_arg=$(ask "Enter format code(s) (e.g. 137+140):") ;;
+    7) ask "Enter format code(s) (e.g. 137+140):"; format_arg="$REPLY" ;;
     *) format_arg="bestvideo+bestaudio/best" ;;
   esac
 
@@ -327,8 +342,8 @@ download_video() {
   echo -e "  ${BOLD}2)${RESET} MKV"
   echo -e "  ${BOLD}3)${RESET} WEBM"
   echo -e "  ${BOLD}4)${RESET} Original (no remux)"
-  local cont_choice
-  cont_choice=$(ask "Choose container [1-4]:")
+  ask "Choose container [1-4]:"
+  local cont_choice="$REPLY"
   local merge_fmt
   case "$cont_choice" in
     1) merge_fmt="mp4"  ;;
@@ -338,14 +353,16 @@ download_video() {
     *) merge_fmt="mp4"  ;;
   esac
 
-  local merge_arg=""
-  [[ -n "$merge_fmt" ]] && merge_arg="--merge-output-format $merge_fmt"
+  # FIX BUG 7: Was passing $merge_arg as unquoted string. Using an array
+  # properly handles the empty case without passing a blank argument.
+  local merge_args=()
+  [[ -n "$merge_fmt" ]] && merge_args=(--merge-output-format "$merge_fmt")
 
   info "Downloading video..."
   touch "$TEMP_DIR/.marker"
   yt-dlp \
     -f "$format_arg" \
-    $merge_arg \
+    "${merge_args[@]}" \
     --output "$VIDEO_DIR/%(title)s.%(ext)s" \
     "$url"
 
@@ -367,7 +384,6 @@ download_image() {
   local url="$1"
   print_section "Image Download"
 
-  # Detect if it's a gallery/social media link (yt-dlp supported)
   local is_gallery=false
   if echo "$url" | grep -qiE "instagram|pinterest|flickr|reddit|imgur|twitter|x\.com|tumblr|500px"; then
     is_gallery=true
@@ -376,30 +392,34 @@ download_image() {
   if $is_gallery; then
     echo -e "  ${BOLD}1)${RESET} Download all images from gallery/post"
     echo -e "  ${BOLD}2)${RESET} Download single image (direct URL)"
-    local g_choice
-    g_choice=$(ask "Choose [1-2]:")
+    ask "Choose [1-2]:"
+    local g_choice="$REPLY"
 
     if [[ "$g_choice" == "1" ]]; then
       echo ""
       echo -e "  ${BOLD}Quality/Size preference:${RESET}"
       echo -e "  ${BOLD}1)${RESET} Best available"
-      echo -e "  ${BOLD}2)${RESET} Medium"
+      echo -e "  ${BOLD}2)${RESET} Medium (re-encoded to 720p)"
       echo -e "  ${BOLD}3)${RESET} Thumbnail only"
-      local img_q
-      img_q=$(ask "Choose quality [1-3]:")
+      ask "Choose quality [1-3]:"
+      local img_q="$REPLY"
 
-      local fmt_arg
+      # FIX BUG 4 & 8: yt-dlp '--format medium' does not exist and
+      # '--format best/medium' are video selectors, invalid for image downloads.
+      # Use proper yt-dlp flags: write-thumbnail for thumbnails, and
+      # --format for video/image posts where applicable.
+      local extra_args=()
       case "$img_q" in
-        1) fmt_arg="--format best" ;;
-        2) fmt_arg="--format medium" ;;
-        3) fmt_arg="--write-thumbnail --skip-download" ;;
-        *) fmt_arg="--format best" ;;
+        1) extra_args=() ;;                                          # yt-dlp picks best by default
+        2) extra_args=(--format "bestvideo[height<=720]+bestaudio/best[height<=720]") ;;
+        3) extra_args=(--write-thumbnail --skip-download) ;;
+        *) extra_args=() ;;
       esac
 
       info "Downloading images..."
       touch "$TEMP_DIR/.marker"
       yt-dlp \
-        $fmt_arg \
+        "${extra_args[@]}" \
         --output "$IMAGE_DIR/%(uploader)s/%(title)s.%(ext)s" \
         "$url"
 
@@ -424,7 +444,15 @@ download_image() {
   # Direct image URL download
   local filename
   filename=$(basename "$url" | sed 's/[?#].*//')
-  [[ -z "${filename##*.}" || "${filename}" == "$filename" ]] && filename="image_$(date +%s).jpg"
+
+  # FIX BUG 5: Original condition was logically inverted and broken.
+  # "${filename##*.}" gives the extension; if filename has no dot, it equals
+  # the whole filename. Correct check: if the stripped extension equals the
+  # full filename, there is no extension → assign a default name.
+  local ext="${filename##*.}"
+  if [[ -z "$ext" || "$ext" == "$filename" ]]; then
+    filename="image_$(date +%s).jpg"
+  fi
 
   echo ""
   echo -e "  Direct image download → ${BOLD}$filename${RESET}"
@@ -445,8 +473,8 @@ download_file() {
   local url="$1"
   print_section "File Download"
 
-  local filename
-  filename=$(ask "Save filename (leave blank for auto-detect):")
+  ask "Save filename (leave blank for auto-detect):"
+  local filename="$REPLY"
   [[ -z "$filename" ]] && filename=$(basename "$url" | sed 's/[?#].*//')
   [[ -z "$filename" ]] && filename="file_$(date +%s)"
 
@@ -457,8 +485,8 @@ download_file() {
   echo -e "  ${BOLD}1)${RESET} curl  (shows progress, most compatible)"
   echo -e "  ${BOLD}2)${RESET} wget  (resume support)"
   echo -e "  ${BOLD}3)${RESET} yt-dlp (for media sites)"
-  local tool_choice
-  tool_choice=$(ask "Choose tool [1-3]:")
+  ask "Choose tool [1-3]:"
+  local tool_choice="$REPLY"
 
   case "$tool_choice" in
     1)
@@ -483,7 +511,6 @@ download_file() {
     success "Download complete!"
     if [[ -f "$out_path" ]]; then
       info "Saved: $out_path ($(human_size "$out_path"))"
-      # Offer ffmpeg compression for known media types
       local ext="${filename##*.}"
       if echo "$ext" | grep -qiE "^(mp4|mkv|avi|mov|webm|flv)$"; then
         if confirm "Compress this video file?"; then
@@ -509,10 +536,10 @@ main() {
   clear
   print_banner
 
-  # Get URL
   local url="${1:-}"
   if [[ -z "$url" ]]; then
-    url=$(ask "Enter URL to download:")
+    ask "Enter URL to download:"
+    url="$REPLY"
   fi
 
   if [[ -z "$url" ]]; then
@@ -522,12 +549,10 @@ main() {
 
   info "URL: $url"
 
-  # Setup
   setup_storage
   make_dirs
   check_deps
 
-  # Choose download type
   echo ""
   print_section "What would you like to download?"
   echo -e "  ${BOLD}1)${RESET} 🎵  Audio       (MP3, M4A, FLAC, etc.)"
@@ -536,8 +561,8 @@ main() {
   echo -e "  ${BOLD}4)${RESET} 📁  File        (any file / direct link)"
   echo ""
 
-  local type_choice
-  type_choice=$(ask "Choose type [1-4]:")
+  ask "Choose type [1-4]:"
+  local type_choice="$REPLY"
 
   case "$type_choice" in
     1) download_audio "$url" ;;
