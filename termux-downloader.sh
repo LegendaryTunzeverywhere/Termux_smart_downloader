@@ -41,17 +41,11 @@ warn()    { echo -e "${YELLOW}⚠ $1${RESET}"; }
 error()   { echo -e "${RED}✖ $1${RESET}"; }
 info()    { echo -e "${CYAN}ℹ $1${RESET}"; }
 
-# FIX BUG 1 & 2: ask() was called inside $() subshells, causing 'read' to
-# receive no input (reads from closed stdin in subshell). Fixed by writing
-# the answer to a global variable directly — no subshell involved.
 ask() {
   echo -ne "${MAGENTA}${BOLD}$1${RESET} " >/dev/tty
   read -r REPLY </dev/tty
-  # REPLY is now a global variable — callers must read $REPLY directly
 }
 
-# FIX BUG 2: confirm() called ask() inside $(), so 'ans' was always empty
-# and confirm always returned false. Fixed to read $REPLY after ask().
 confirm() {
   ask "$1 [y/N]:"
   [[ "$REPLY" =~ ^[Yy]$ ]]
@@ -61,12 +55,9 @@ make_dirs() {
   mkdir -p "$AUDIO_DIR" "$VIDEO_DIR" "$IMAGE_DIR" "$FILE_DIR" "$TEMP_DIR"
 }
 
-# FIX BUG 6: Loop variable named 'pkg' shadowed the Termux 'pkg' binary,
-# breaking all 'pkg install' calls. Renamed loop variable to 'tool'.
-# FIX BUG 10: Added check for pip before attempting 'pip install yt-dlp'.
 check_deps() {
   local missing=()
-  for cmd in yt-dlp ffmpeg curl wget; do
+  for cmd in yt-dlp ffmpeg curl wget bc; do
     command -v "$cmd" &>/dev/null || missing+=("$cmd")
   done
   if [[ ${#missing[@]} -gt 0 ]]; then
@@ -87,6 +78,7 @@ check_deps() {
         ffmpeg) pkg install -y ffmpeg ;;
         curl)   pkg install -y curl   ;;
         wget)   pkg install -y wget   ;;
+        bc)     pkg install -y bc     ;;
       esac
     done
   fi
@@ -107,6 +99,114 @@ human_size() {
   else
     echo "unknown"
   fi
+}
+
+# ── Progress Utilities ────────────────────────────────────────
+
+# Spinner — used for near-instant operations (image compress, format fetch)
+SPINNER_PID=""
+
+spinner_start() {
+  local label="$1"
+  local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  (
+    local i=0
+    while true; do
+      printf "\r  ${CYAN}${frames[$i]}${RESET}  %s..." "$label" >/dev/tty
+      i=$(( (i+1) % ${#frames[@]} ))
+      sleep 0.1
+    done
+  ) &
+  SPINNER_PID=$!
+  disown "$SPINNER_PID" 2>/dev/null
+}
+
+spinner_stop() {
+  local label="${1:-Done}"
+  if [[ -n "$SPINNER_PID" ]]; then
+    kill "$SPINNER_PID" 2>/dev/null
+    wait "$SPINNER_PID" 2>/dev/null
+    SPINNER_PID=""
+  fi
+  printf "\r%-70s\r" " " >/dev/tty
+  success "$label"
+}
+
+# Draw a [████░░░] bar — called by ffmpeg_progress loop
+# Usage: draw_bar <percent 0-100> <label>
+draw_bar() {
+  local pct="$1"
+  local label="$2"
+  local width=30
+  local filled=$(( pct * width / 100 ))
+  local empty=$(( width - filled ))
+  local bar=""
+  local i
+  for (( i=0; i<filled; i++ )); do bar+="█"; done
+  for (( i=0; i<empty;  i++ )); do bar+="░"; done
+  printf "\r  ${CYAN}[%s]${RESET} ${BOLD}%3d%%${RESET}  %s" "$bar" "$pct" "$label" >/dev/tty
+}
+
+# ffmpeg with a live percentage bar.
+# Usage: ffmpeg_progress <duration_seconds> <label> <output_file> <ffmpeg_args...>
+# The output file must NOT be in ffmpeg_args — it is appended here so we can
+# inject -progress and -y cleanly.
+ffmpeg_progress() {
+  local duration_s="$1"
+  local label="$2"
+  local output_file="$3"
+  shift 3
+  # remaining args = all ffmpeg flags except -y and the output path
+
+  local progress_pipe="$TEMP_DIR/.ffprogress_$$"
+  rm -f "$progress_pipe"
+
+  # Run ffmpeg in background; -progress writes machine-readable key=value lines
+  ffmpeg "$@" \
+    -progress "$progress_pipe" \
+    -nostats -loglevel error \
+    -y "$output_file" &
+  local ffmpeg_pid=$!
+
+  draw_bar 0 "$label"
+
+  local pct=0
+  while kill -0 "$ffmpeg_pid" 2>/dev/null; do
+    if [[ -f "$progress_pipe" ]]; then
+      # out_time_us = microseconds of encoded output so far
+      local out_us
+      out_us=$(grep '^out_time_us=' "$progress_pipe" 2>/dev/null | tail -1 | cut -d= -f2)
+      if [[ -n "$out_us" && "$out_us" =~ ^[0-9]+$ && "$duration_s" -gt 0 ]]; then
+        # convert µs → centiseconds, divide by duration in centiseconds → %
+        pct=$(( out_us / 10000 / duration_s ))
+        [[ $pct -gt 100 ]] && pct=100
+        draw_bar "$pct" "$label"
+      fi
+    fi
+    sleep 0.3
+  done
+
+  wait "$ffmpeg_pid"
+  local exit_code=$?
+  rm -f "$progress_pipe"
+
+  if [[ $exit_code -eq 0 ]]; then
+    draw_bar 100 "$label"
+    printf "\n" >/dev/tty
+  else
+    printf "\r%-70s\r" " " >/dev/tty
+  fi
+  return $exit_code
+}
+
+# Probe media duration in whole seconds; returns 1 on failure (avoids div/0)
+get_duration() {
+  local file="$1"
+  local d
+  d=$(ffprobe -v error -show_entries format=duration \
+    -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null)
+  local secs="${d%.*}"
+  [[ "$secs" =~ ^[0-9]+$ && "$secs" -gt 0 ]] && echo "$secs" || echo 1
 }
 
 # ── Compression ──────────────────────────────────────────────
@@ -131,8 +231,13 @@ compress_audio() {
     *) warn "Invalid choice, skipping compression."; return ;;
   esac
 
-  info "Compressing audio to ${bitrate}..."
-  ffmpeg -i "$input" -b:a "$bitrate" -y "$output" 2>/dev/null
+  local duration
+  duration=$(get_duration "$input")
+
+  info "Compressing audio → ${bitrate}..."
+  ffmpeg_progress "$duration" "Compressing audio" "$output" \
+    -i "$input" -b:a "$bitrate"
+
   if [[ $? -eq 0 ]]; then
     success "Compressed: $output ($(human_size "$output"))"
     if confirm "Delete original uncompressed file?"; then
@@ -157,6 +262,8 @@ compress_video() {
   local choice="$REPLY"
 
   local output="${input%.*}_compressed.mp4"
+  local duration
+  duration=$(get_duration "$input")
   local crf
 
   case "$choice" in
@@ -166,17 +273,13 @@ compress_video() {
     4) ask "Enter CRF value [18-51]:"; crf="$REPLY" ;;
     5)
       ask "Target size in MB:"; local target_mb="$REPLY"
-      local duration
-      duration=$(ffprobe -v error -show_entries format=duration \
-        -of default=noprint_wrappers=1:nokey=1 "$input" 2>/dev/null)
-      # FIX BUG 9: Subtract audio bitrate (128k) from total to avoid
-      # exceeding target size. Formula: ((MB*8192) / duration) - audio_kbps
       local bitrate
       bitrate=$(echo "scale=0; ($target_mb * 8192) / $duration - 128" | bc)
-      [[ "$bitrate" -lt 100 ]] && bitrate=100  # floor to avoid unusable bitrate
-      info "Targeting ~${target_mb}MB with video bitrate ${bitrate}k + 128k audio..."
-      ffmpeg -i "$input" -b:v "${bitrate}k" -bufsize "${bitrate}k" \
-        -maxrate "${bitrate}k" -b:a 128k -y "$output" 2>/dev/null
+      [[ "$bitrate" -lt 100 ]] && bitrate=100
+      info "Targeting ~${target_mb}MB (video ${bitrate}k + audio 128k)..."
+      ffmpeg_progress "$duration" "Compressing video" "$output" \
+        -i "$input" -b:v "${bitrate}k" -bufsize "${bitrate}k" \
+        -maxrate "${bitrate}k" -b:a 128k
       if [[ $? -eq 0 ]]; then
         success "Compressed: $output ($(human_size "$output"))"
         if confirm "Delete original?"; then rm -f "$input"; fi
@@ -189,8 +292,10 @@ compress_video() {
   esac
 
   info "Compressing video (CRF=$crf)..."
-  ffmpeg -i "$input" -vcodec libx264 -crf "$crf" -preset fast \
-    -acodec aac -b:a 128k -y "$output" 2>/dev/null
+  ffmpeg_progress "$duration" "Compressing video" "$output" \
+    -i "$input" -vcodec libx264 -crf "$crf" -preset fast \
+    -acodec aac -b:a 128k
+
   if [[ $? -eq 0 ]]; then
     success "Compressed: $output ($(human_size "$output"))"
     if confirm "Delete original?"; then rm -f "$input"; fi
@@ -220,10 +325,15 @@ compress_image() {
     *) warn "Invalid choice, skipping compression."; return ;;
   esac
 
+  # Images compress in under a second — spinner is more appropriate than a bar
   info "Compressing image (quality=$quality)..."
+  spinner_start "Compressing image"
   ffmpeg -i "$input" -q:v "$quality" -y "$output" 2>/dev/null
-  if [[ $? -eq 0 ]]; then
-    success "Compressed: $output ($(human_size "$output"))"
+  local exit_code=$?
+  spinner_stop "Image compressed"
+
+  if [[ $exit_code -eq 0 ]]; then
+    success "Saved: $output ($(human_size "$output"))"
     if confirm "Delete original?"; then rm -f "$input"; fi
   else
     error "Compression failed."
@@ -271,11 +381,13 @@ download_audio() {
     *) quality_arg="0" ;;
   esac
 
-  # FIX BUG 3 (audio side): Create marker file before download so the
-  # fallback find uses .marker (not the directory itself) for -newer comparison.
   touch "$TEMP_DIR/.marker"
+  info "Downloading audio as ${fmt^^}..."
+  echo ""
 
-  info "Downloading audio as ${fmt}..."
+  # yt-dlp has a rich built-in progress display; --newline keeps each update
+  # on its own line which works best in Termux (no ANSI cursor tricks needed).
+  # We capture the final saved path via --print after_move:filepath.
   local out_file
   out_file=$(yt-dlp \
     --extract-audio \
@@ -283,15 +395,20 @@ download_audio() {
     --audio-quality "$quality_arg" \
     --output "$AUDIO_DIR/%(title)s.%(ext)s" \
     --print after_move:filepath \
-    "$url" 2>/dev/null | tail -1)
+    --newline \
+    "$url" 2>&1 | tee /dev/tty | grep -v '^\[' | grep -v '^$' | tail -1)
 
+  # Strip ANSI escape codes and whitespace from captured path
+  out_file=$(printf '%s' "$out_file" | sed 's/\x1b\[[0-9;]*[mK]//g' | tr -d '\r' | xargs 2>/dev/null)
+
+  echo ""
   if [[ -f "$out_file" ]]; then
     success "Saved: $out_file ($(human_size "$out_file"))"
     if confirm "Compress this audio file?"; then
       compress_audio "$out_file"
     fi
   else
-    # FIX BUG 3: Was using "$TEMP_DIR" (directory) instead of "$TEMP_DIR/.marker"
+    # Fallback: find the newest matching file created after our marker
     out_file=$(find "$AUDIO_DIR" -name "*.${fmt}" -newer "$TEMP_DIR/.marker" 2>/dev/null | head -1)
     if [[ -f "$out_file" ]]; then
       success "Saved: $out_file ($(human_size "$out_file"))"
@@ -308,9 +425,14 @@ download_video() {
   local url="$1"
   print_section "Video Download"
 
-  info "Fetching available formats..."
+  # Spinner while fetching format list (network call, unknown duration)
+  spinner_start "Fetching available formats"
+  local fmt_list
+  fmt_list=$(yt-dlp -F "$url" 2>/dev/null)
+  spinner_stop "Formats ready"
+
   echo ""
-  yt-dlp -F "$url" 2>/dev/null | grep -E "^[0-9]|ID |---"
+  echo "$fmt_list" | grep -E "^[0-9]|ID |---"
   echo ""
 
   echo -e "  ${BOLD}Quick quality select:${RESET}"
@@ -353,20 +475,23 @@ download_video() {
     *) merge_fmt="mp4"  ;;
   esac
 
-  # FIX BUG 7: Was passing $merge_arg as unquoted string. Using an array
-  # properly handles the empty case without passing a blank argument.
   local merge_args=()
   [[ -n "$merge_fmt" ]] && merge_args=(--merge-output-format "$merge_fmt")
 
   info "Downloading video..."
+  echo ""
   touch "$TEMP_DIR/.marker"
+
+  # yt-dlp's native progress display; --newline = one update per line (Termux-safe)
   yt-dlp \
     -f "$format_arg" \
     "${merge_args[@]}" \
     --output "$VIDEO_DIR/%(title)s.%(ext)s" \
+    --newline \
     "$url"
 
   local exit_code=$?
+  echo ""
   local out_file
   out_file=$(find "$VIDEO_DIR" -newer "$TEMP_DIR/.marker" -type f 2>/dev/null | head -1)
 
@@ -404,25 +529,24 @@ download_image() {
       ask "Choose quality [1-3]:"
       local img_q="$REPLY"
 
-      # FIX BUG 4 & 8: yt-dlp '--format medium' does not exist and
-      # '--format best/medium' are video selectors, invalid for image downloads.
-      # Use proper yt-dlp flags: write-thumbnail for thumbnails, and
-      # --format for video/image posts where applicable.
       local extra_args=()
       case "$img_q" in
-        1) extra_args=() ;;                                          # yt-dlp picks best by default
+        1) extra_args=() ;;
         2) extra_args=(--format "bestvideo[height<=720]+bestaudio/best[height<=720]") ;;
         3) extra_args=(--write-thumbnail --skip-download) ;;
         *) extra_args=() ;;
       esac
 
       info "Downloading images..."
+      echo ""
       touch "$TEMP_DIR/.marker"
       yt-dlp \
         "${extra_args[@]}" \
         --output "$IMAGE_DIR/%(uploader)s/%(title)s.%(ext)s" \
+        --newline \
         "$url"
 
+      echo ""
       local out_file
       out_file=$(find "$IMAGE_DIR" -newer "$TEMP_DIR/.marker" -type f 2>/dev/null | head -1)
       if [[ -f "$out_file" ]]; then
@@ -441,14 +565,9 @@ download_image() {
     fi
   fi
 
-  # Direct image URL download
+  # Direct image URL — curl's --progress-bar gives a native ASCII bar
   local filename
   filename=$(basename "$url" | sed 's/[?#].*//')
-
-  # FIX BUG 5: Original condition was logically inverted and broken.
-  # "${filename##*.}" gives the extension; if filename has no dot, it equals
-  # the whole filename. Correct check: if the stripped extension equals the
-  # full filename, there is no extension → assign a default name.
   local ext="${filename##*.}"
   if [[ -z "$ext" || "$ext" == "$filename" ]]; then
     filename="image_$(date +%s).jpg"
@@ -456,10 +575,13 @@ download_image() {
 
   echo ""
   echo -e "  Direct image download → ${BOLD}$filename${RESET}"
-
+  echo ""
   info "Downloading image..."
+  # --progress-bar = native curl progress bar (####    )
   curl -L --progress-bar -o "$IMAGE_DIR/$filename" "$url"
+
   if [[ $? -eq 0 && -f "$IMAGE_DIR/$filename" ]]; then
+    echo ""
     success "Saved: $IMAGE_DIR/$filename ($(human_size "$IMAGE_DIR/$filename"))"
     if confirm "Compress this image?"; then
       compress_image "$IMAGE_DIR/$filename"
@@ -482,24 +604,28 @@ download_file() {
 
   echo ""
   echo -e "  ${BOLD}Download tool:${RESET}"
-  echo -e "  ${BOLD}1)${RESET} curl  (shows progress, most compatible)"
-  echo -e "  ${BOLD}2)${RESET} wget  (resume support)"
+  echo -e "  ${BOLD}1)${RESET} curl  (progress bar, most compatible)"
+  echo -e "  ${BOLD}2)${RESET} wget  (progress bar + resume support)"
   echo -e "  ${BOLD}3)${RESET} yt-dlp (for media sites)"
   ask "Choose tool [1-3]:"
   local tool_choice="$REPLY"
+  echo ""
 
   case "$tool_choice" in
     1)
       info "Downloading with curl..."
+      # --progress-bar = native curl [####    ] bar
       curl -L --progress-bar -C - -o "$out_path" "$url"
       ;;
     2)
       info "Downloading with wget..."
+      # --show-progress = native wget progress bar
       wget -c --show-progress -O "$out_path" "$url"
       ;;
     3)
       info "Downloading with yt-dlp..."
-      yt-dlp --output "$FILE_DIR/%(title)s.%(ext)s" "$url"
+      # --newline keeps each progress update on its own line (Termux-safe)
+      yt-dlp --output "$FILE_DIR/%(title)s.%(ext)s" --newline "$url"
       ;;
     *)
       info "Downloading with curl..."
@@ -507,23 +633,20 @@ download_file() {
       ;;
   esac
 
-  if [[ $? -eq 0 ]]; then
+  local dl_exit=$?
+  echo ""
+
+  if [[ $dl_exit -eq 0 ]]; then
     success "Download complete!"
     if [[ -f "$out_path" ]]; then
       info "Saved: $out_path ($(human_size "$out_path"))"
       local ext="${filename##*.}"
       if echo "$ext" | grep -qiE "^(mp4|mkv|avi|mov|webm|flv)$"; then
-        if confirm "Compress this video file?"; then
-          compress_video "$out_path"
-        fi
+        if confirm "Compress this video file?"; then compress_video "$out_path"; fi
       elif echo "$ext" | grep -qiE "^(mp3|m4a|aac|wav|flac|ogg)$"; then
-        if confirm "Compress this audio file?"; then
-          compress_audio "$out_path"
-        fi
+        if confirm "Compress this audio file?"; then compress_audio "$out_path"; fi
       elif echo "$ext" | grep -qiE "^(jpg|jpeg|png|webp|bmp)$"; then
-        if confirm "Compress this image?"; then
-          compress_image "$out_path"
-        fi
+        if confirm "Compress this image?"; then compress_image "$out_path"; fi
       fi
     fi
   else
