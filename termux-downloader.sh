@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # ============================================================
-#  Termux Smart Downloader
+#  Termux Smart Downloader  v2.1
 #  Usage: termux-downloader.sh [URL]
 # ============================================================
 
@@ -22,7 +22,10 @@ IMAGE_DIR="$DOWNLOAD_DIR/Images"
 FILE_DIR="$DOWNLOAD_DIR/Files"
 TEMP_DIR="$DOWNLOAD_DIR/.tmp"
 
-# Summary tracking — populated during the session
+SCRIPT_VERSION="2.1"
+SCRIPT_PATH="$(realpath "$0" 2>/dev/null || echo "$0")"
+
+# Summary tracking
 SUMMARY_FILE=""
 SUMMARY_COMPRESSED=""
 SUMMARY_TYPE=""
@@ -33,13 +36,13 @@ SPINNER_PID=""
 cleanup() {
   if [[ -n "$SPINNER_PID" ]] && kill -0 "$SPINNER_PID" 2>/dev/null; then
     kill "$SPINNER_PID" 2>/dev/null
+    wait "$SPINNER_PID" 2>/dev/null
   fi
-  # Clear any leftover spinner line on the tty
   [[ -t 1 ]] && printf "\r%-70s\r" " " >/dev/tty 2>/dev/null
 }
 on_interrupt() {
   cleanup
-  echo "" >/dev/tty 2>/dev/null
+  printf "\n" >/dev/tty 2>/dev/null
   exit 130
 }
 trap cleanup EXIT
@@ -49,19 +52,16 @@ trap on_interrupt INT TERM
 print_banner() {
   echo -e "${CYAN}${BOLD}"
   echo "╔══════════════════════════════════════╗"
-  echo "║      Termux Smart Downloader         ║"
+  echo "║    Termux Smart Downloader v${SCRIPT_VERSION}     ║"
   echo "╚══════════════════════════════════════╝"
   echo -e "${RESET}"
 }
 
-print_section() {
-  echo -e "\n${BLUE}${BOLD}▶ $1${RESET}"
-}
-
-success() { echo -e "${GREEN}✔ $1${RESET}"; }
-warn()    { echo -e "${YELLOW}⚠ $1${RESET}"; }
-error()   { echo -e "${RED}✖ $1${RESET}"; }
-info()    { echo -e "${CYAN}ℹ $1${RESET}"; }
+print_section() { echo -e "\n${BLUE}${BOLD}▶ $1${RESET}"; }
+success()        { echo -e "${GREEN}✔ $1${RESET}"; }
+warn()           { echo -e "${YELLOW}⚠ $1${RESET}"; }
+error()          { echo -e "${RED}✖ $1${RESET}"; }
+info()           { echo -e "${CYAN}ℹ $1${RESET}"; }
 
 ask() {
   echo -ne "${MAGENTA}${BOLD}$1${RESET} " >/dev/tty
@@ -77,77 +77,130 @@ make_dirs() {
   mkdir -p "$AUDIO_DIR" "$VIDEO_DIR" "$IMAGE_DIR" "$FILE_DIR" "$TEMP_DIR"
 }
 
-check_deps() {
-  local missing=()
-  for cmd in yt-dlp ffmpeg curl wget bc; do
-    command -v "$cmd" &>/dev/null || missing+=("$cmd")
-  done
-  if [[ ${#missing[@]} -gt 0 ]]; then
-    warn "Missing tools: ${missing[*]}"
-    confirm "Install missing packages now?" || { error "Cannot continue without required tools."; exit 1; }
-    spinner_start "Updating package lists"
-    pkg update -y &>/dev/null
-    spinner_stop "Package lists updated"
-    for tool in "${missing[@]}"; do
-      case "$tool" in
-        yt-dlp)
-          if command -v pip &>/dev/null; then
-            spinner_start "Installing yt-dlp"
-            pip install -U yt-dlp &>/dev/null
-            spinner_stop "yt-dlp installed"
-          else
-            spinner_start "Installing python"
-            pkg install -y python &>/dev/null
-            spinner_stop "Python installed"
-            spinner_start "Installing yt-dlp"
-            pip install -U yt-dlp &>/dev/null
-            spinner_stop "yt-dlp installed"
-          fi
-          ;;
-        ffmpeg)
-          spinner_start "Installing ffmpeg"
-          pkg install -y ffmpeg &>/dev/null
-          spinner_stop "ffmpeg installed"
-          ;;
-        curl)
-          spinner_start "Installing curl"
-          pkg install -y curl &>/dev/null
-          spinner_stop "curl installed"
-          ;;
-        wget)
-          spinner_start "Installing wget"
-          pkg install -y wget &>/dev/null
-          spinner_stop "wget installed"
-          ;;
-        bc)
-          spinner_start "Installing bc"
-          pkg install -y bc &>/dev/null
-          spinner_stop "bc installed"
-          ;;
-      esac
-    done
-  fi
-}
-
-setup_storage() {
-  if [[ ! -d "$HOME/storage/downloads" ]]; then
-    warn "Termux storage permission not set up yet."
-    info "Running termux-setup-storage. Tap ALLOW on the Android permission dialog."
-    termux-setup-storage
-    # Poll for up to 60s while user grants permission
+# ── Spinner ───────────────────────────────────────────────────
+spinner_start() {
+  local label="$1"
+  local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  (
     local i=0
-    while (( i < 60 )) && [[ ! -d "$HOME/storage/downloads" ]]; do
-      sleep 1
-      i=$(( i + 1 ))
+    while true; do
+      printf "\r  ${CYAN}${frames[$i]}${RESET}  %s..." "$label" >/dev/tty
+      i=$(( (i+1) % ${#frames[@]} ))
+      sleep 0.1
     done
-    if [[ ! -d "$HOME/storage/downloads" ]]; then
-      error "Storage was not granted. Run 'termux-setup-storage', allow access, then re-run."
-      exit 1
-    fi
-    success "Storage permission granted."
-  fi
+  ) &
+  SPINNER_PID=$!
 }
 
+spinner_stop() {
+  local label="${1:-Done}"
+  if [[ -n "$SPINNER_PID" ]]; then
+    kill "$SPINNER_PID" 2>/dev/null
+    wait "$SPINNER_PID" 2>/dev/null
+    SPINNER_PID=""
+  fi
+  printf "\r%-70s\r" " " >/dev/tty
+  success "$label"
+}
+
+spinner_fail() {
+  local label="${1:-Failed}"
+  if [[ -n "$SPINNER_PID" ]]; then
+    kill "$SPINNER_PID" 2>/dev/null
+    wait "$SPINNER_PID" 2>/dev/null
+    SPINNER_PID=""
+  fi
+  printf "\r%-70s\r" " " >/dev/tty
+  error "$label"
+}
+
+# ── Progress bar ─────────────────────────────────────────────
+draw_bar() {
+  local pct="$1" label="$2"
+  local width=30
+  local filled=$(( pct * width / 100 ))
+  local empty=$(( width - filled ))
+  local bar="" i
+  for (( i=0; i<filled; i++ )); do bar+="█"; done
+  for (( i=0; i<empty;  i++ )); do bar+="░"; done
+  printf "\r  ${CYAN}[%s]${RESET} ${BOLD}%3d%%${RESET}  %s" "$bar" "$pct" "$label" >/dev/tty
+}
+
+# ── ffmpeg with progress bar ──────────────────────────────────
+ffmpeg_progress() {
+  local duration_s="$1" label="$2" output_file="$3"
+  shift 3
+
+  local progress_pipe="$TEMP_DIR/.ffprogress_$$"
+  rm -f "$progress_pipe"
+  mkfifo "$progress_pipe" 2>/dev/null || { rm -f "$progress_pipe"; touch "$progress_pipe"; }
+
+  ffmpeg "$@" \
+    -progress "$progress_pipe" \
+    -nostats -loglevel error \
+    -y "$output_file" &
+  local ffmpeg_pid=$!
+
+  draw_bar 0 "$label"
+
+  local pct_file="$TEMP_DIR/.ffpct_$$"
+  echo 0 > "$pct_file"
+  (
+    while IFS= read -r line; do
+      if [[ "$line" == out_time_us=* ]]; then
+        local val="${line#out_time_us=}"
+        if [[ "$val" =~ ^[0-9]+$ && "$duration_s" -gt 0 ]]; then
+          local p=$(( val / 10000 / duration_s ))
+          [[ $p -gt 100 ]] && p=100
+          echo "$p" > "$pct_file"
+        fi
+      fi
+    done < "$progress_pipe"
+  ) &
+  local reader_pid=$!
+
+  while kill -0 "$ffmpeg_pid" 2>/dev/null; do
+    local pct
+    pct=$(cat "$pct_file" 2>/dev/null || echo 0)
+    draw_bar "$pct" "$label"
+    sleep 0.3
+  done
+
+  wait "$ffmpeg_pid"
+  local exit_code=$?
+  wait "$reader_pid" 2>/dev/null
+  rm -f "$progress_pipe" "$pct_file"
+
+  if [[ $exit_code -eq 0 ]]; then
+    draw_bar 100 "$label"
+    printf "\n" >/dev/tty
+  else
+    printf "\r%-70s\r" " " >/dev/tty
+  fi
+  return $exit_code
+}
+
+# ── Duration via ffprobe ──────────────────────────────────────
+get_duration() {
+  local file="$1"
+  local d
+  d=$(ffprobe -v error -show_entries format=duration \
+    -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null)
+  local secs="${d%.*}"
+  [[ "$secs" =~ ^[0-9]+$ && "$secs" -gt 0 ]] && echo "$secs" || echo 1
+}
+
+# ── Latest file in dir newer than marker ─────────────────────
+latest_in_dir() {
+  local dir="$1" marker="$2"
+  find "$dir" -newer "$marker" -type f 2>/dev/null \
+    | while IFS= read -r f; do
+        printf '%s\t%s\n' "$(stat -c '%Y' "$f" 2>/dev/null)" "$f"
+      done \
+    | sort -rn | head -1 | cut -f2-
+}
+
+# ── Human readable size ───────────────────────────────────────
 human_size() {
   local file="$1"
   if [[ -f "$file" ]]; then
@@ -157,6 +210,7 @@ human_size() {
   fi
 }
 
+# ── Elapsed time ─────────────────────────────────────────────
 elapsed_time() {
   local start="${SUMMARY_START_TIME:-0}"
   local secs=$(( $(date +%s) - start ))
@@ -168,7 +222,232 @@ elapsed_time() {
   fi
 }
 
-# ── Summary Screen ────────────────────────────────────────────
+# ── Storage setup ─────────────────────────────────────────────
+setup_storage() {
+  if [[ ! -d "$HOME/storage/downloads" ]]; then
+    warn "Termux storage permission not set up yet."
+    info "Running termux-setup-storage. Tap ALLOW on the Android permission dialog."
+    termux-setup-storage
+    local i=0
+    while (( i < 60 )) && [[ ! -d "$HOME/storage/downloads" ]]; do
+      sleep 1; i=$(( i + 1 ))
+    done
+    if [[ ! -d "$HOME/storage/downloads" ]]; then
+      error "Storage not granted. Run 'termux-setup-storage', allow, then re-run."
+      exit 1
+    fi
+    success "Storage permission granted."
+  fi
+}
+
+# ── Dependency install helper ─────────────────────────────────
+_install_pkg() {
+  local name="$1"
+  spinner_start "Installing $name"
+  pkg install -y "$name" &>/dev/null
+  spinner_stop "$name installed"
+}
+
+_install_ytdlp() {
+  if ! command -v pip &>/dev/null; then
+    _install_pkg python
+  fi
+  spinner_start "Installing yt-dlp"
+  pip install -U yt-dlp &>/dev/null
+  spinner_stop "yt-dlp installed"
+}
+
+# ── Check & install missing deps ─────────────────────────────
+check_deps() {
+  local missing=()
+  for cmd in yt-dlp ffmpeg curl wget bc; do
+    command -v "$cmd" &>/dev/null || missing+=("$cmd")
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    warn "Missing tools: ${missing[*]}"
+    confirm "Install missing packages now?" || {
+      error "Cannot continue without required tools."
+      exit 1
+    }
+    spinner_start "Updating package lists"
+    pkg update -y &>/dev/null
+    spinner_stop "Package lists updated"
+    for tool in "${missing[@]}"; do
+      case "$tool" in
+        yt-dlp)  _install_ytdlp ;;
+        ffmpeg)  _install_pkg ffmpeg ;;
+        curl)    _install_pkg curl ;;
+        wget)    _install_pkg wget ;;
+        bc)      _install_pkg bc ;;
+      esac
+    done
+  fi
+}
+
+# ════════════════════════════════════════════════════════════
+#  VERSION CHECK & UPDATE SYSTEM
+# ════════════════════════════════════════════════════════════
+
+# Returns installed version string for a tool (empty if not found)
+get_installed_version() {
+  local tool="$1"
+  case "$tool" in
+    yt-dlp)  yt-dlp  --version 2>/dev/null | head -1 ;;
+    ffmpeg)  ffmpeg  -version  2>/dev/null | grep -oP 'ffmpeg version \K\S+' | head -1 ;;
+    curl)    curl    --version 2>/dev/null | grep -oP 'curl \K[0-9]+\.[0-9]+\.[0-9]+' | head -1 ;;
+    wget)    wget    --version 2>/dev/null | grep -oP 'GNU Wget \K[0-9]+\.[0-9]+' | head -1 ;;
+    bc)      bc      --version 2>/dev/null | grep -oP '[0-9]+\.[0-9]+' | head -1 ;;
+    python)  python  --version 2>/dev/null | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1 ;;
+    *) echo "?" ;;
+  esac
+}
+
+# Returns "latest" version available from pkg/pip (best-effort)
+get_latest_version() {
+  local tool="$1"
+  case "$tool" in
+    yt-dlp)
+      # pip index versions is the cleanest way; fallback to PyPI JSON API
+      pip index versions yt-dlp 2>/dev/null \
+        | grep -oP 'Available versions: \K[^\n]+' \
+        | tr ',' ' ' | awk '{print $1}' \
+      || curl -sf "https://pypi.org/pypi/yt-dlp/json" 2>/dev/null \
+           | grep -oP '"version":"\K[^"]+' | head -1
+      ;;
+    ffmpeg|curl|wget|bc|python)
+      # pkg show returns Installed/Latest lines; grab Latest
+      pkg show "$tool" 2>/dev/null \
+        | grep -i '^Version:' | awk '{print $2}' | head -1
+      ;;
+    *) echo "?" ;;
+  esac
+}
+
+# Update a single tool
+update_tool() {
+  local tool="$1"
+  case "$tool" in
+    yt-dlp)
+      spinner_start "Updating yt-dlp"
+      pip install -U yt-dlp &>/dev/null
+      spinner_stop "yt-dlp updated to $(get_installed_version yt-dlp)"
+      ;;
+    ffmpeg|curl|wget|bc|python)
+      spinner_start "Updating $tool"
+      pkg install -y "$tool" &>/dev/null
+      spinner_stop "$tool updated to $(get_installed_version "$tool")"
+      ;;
+    *)
+      warn "Don't know how to update: $tool"
+      ;;
+  esac
+}
+
+# Full version-check & update menu
+check_versions() {
+  print_section "Dependency Versions"
+
+  local tools=(yt-dlp ffmpeg curl wget bc python)
+  local -A installed
+  local -A latest
+
+  # Collect versions with spinners
+  for tool in "${tools[@]}"; do
+    spinner_start "Checking $tool"
+    if command -v "$tool" &>/dev/null; then
+      installed[$tool]=$(get_installed_version "$tool")
+      latest[$tool]=$(get_latest_version "$tool")
+    else
+      installed[$tool]="NOT INSTALLED"
+      latest[$tool]="n/a"
+    fi
+    # Kill spinner manually so we can print the table row cleanly
+    if [[ -n "$SPINNER_PID" ]]; then
+      kill "$SPINNER_PID" 2>/dev/null
+      wait "$SPINNER_PID" 2>/dev/null
+      SPINNER_PID=""
+    fi
+    printf "\r%-70s\r" " " >/dev/tty
+  done
+
+  # Print table
+  echo ""
+  printf "  ${BOLD}%-10s  %-20s  %-20s  %s${RESET}\n" "Tool" "Installed" "Latest (pkg)" "Status"
+  printf "  %s\n" "──────────────────────────────────────────────────────────"
+  for tool in "${tools[@]}"; do
+    local inst="${installed[$tool]:-?}"
+    local lat="${latest[$tool]:-?}"
+    local status
+
+    if [[ "$inst" == "NOT INSTALLED" ]]; then
+      status="${RED}✖ missing${RESET}"
+    elif [[ -z "$lat" || "$lat" == "?" || "$lat" == "n/a" ]]; then
+      status="${YELLOW}? unknown${RESET}"
+    elif [[ "$inst" == "$lat" ]]; then
+      status="${GREEN}✔ up to date${RESET}"
+    else
+      status="${YELLOW}↑ update available${RESET}"
+    fi
+
+    printf "  %-10s  %-20s  %-20s  " "$tool" "$inst" "${lat:-?}"
+    echo -e "$status"
+  done
+  echo ""
+
+  # Offer to update outdated / install missing
+  local to_update=()
+  for tool in "${tools[@]}"; do
+    local inst="${installed[$tool]:-?}"
+    local lat="${latest[$tool]:-?}"
+    if [[ "$inst" == "NOT INSTALLED" ]]; then
+      to_update+=("$tool")
+    elif [[ -n "$lat" && "$lat" != "?" && "$lat" != "n/a" && "$inst" != "$lat" ]]; then
+      to_update+=("$tool")
+    fi
+  done
+
+  if [[ ${#to_update[@]} -eq 0 ]]; then
+    success "All tools are up to date!"
+    return
+  fi
+
+  echo -e "  ${YELLOW}Tools needing attention:${RESET} ${to_update[*]}"
+  echo ""
+  echo -e "  ${BOLD}1)${RESET} Update / install all of the above"
+  echo -e "  ${BOLD}2)${RESET} Choose which ones to update"
+  echo -e "  ${BOLD}3)${RESET} Skip (do nothing)"
+  ask "Choose [1-3]:"
+  local uchoice="$REPLY"
+
+  case "$uchoice" in
+    1)
+      spinner_start "Refreshing pkg lists"
+      pkg update -y &>/dev/null
+      spinner_stop "pkg lists refreshed"
+      for tool in "${to_update[@]}"; do
+        update_tool "$tool"
+      done
+      success "All done!"
+      ;;
+    2)
+      spinner_start "Refreshing pkg lists"
+      pkg update -y &>/dev/null
+      spinner_stop "pkg lists refreshed"
+      for tool in "${to_update[@]}"; do
+        if confirm "Update $tool (${installed[$tool]} → ${latest[$tool]})?"; then
+          update_tool "$tool"
+        fi
+      done
+      ;;
+    *)
+      info "Skipped."
+      ;;
+  esac
+}
+
+# ════════════════════════════════════════════════════════════
+#  SUMMARY SCREEN
+# ════════════════════════════════════════════════════════════
 print_summary() {
   local elapsed
   elapsed=$(elapsed_time)
@@ -201,123 +480,9 @@ print_summary() {
   read -r </dev/tty
 }
 
-# ── Progress Utilities ────────────────────────────────────────
-
-spinner_start() {
-  local label="$1"
-  local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
-  (
-    local i=0
-    while true; do
-      printf "\r  ${CYAN}${frames[$i]}${RESET}  %s..." "$label" >/dev/tty
-      i=$(( (i+1) % ${#frames[@]} ))
-      sleep 0.1
-    done
-  ) &
-  SPINNER_PID=$!
-}
-
-spinner_stop() {
-  local label="${1:-Done}"
-  if [[ -n "$SPINNER_PID" ]]; then
-    kill "$SPINNER_PID" 2>/dev/null
-    wait "$SPINNER_PID" 2>/dev/null
-    SPINNER_PID=""
-  fi
-  printf "\r%-70s\r" " " >/dev/tty
-  success "$label"
-}
-
-draw_bar() {
-  local pct="$1"
-  local label="$2"
-  local width=30
-  local filled=$(( pct * width / 100 ))
-  local empty=$(( width - filled ))
-  local bar="" i
-  for (( i=0; i<filled; i++ )); do bar+="█"; done
-  for (( i=0; i<empty;  i++ )); do bar+="░"; done
-  printf "\r  ${CYAN}[%s]${RESET} ${BOLD}%3d%%${RESET}  %s" "$bar" "$pct" "$label" >/dev/tty
-}
-
-ffmpeg_progress() {
-  local duration_s="$1"
-  local label="$2"
-  local output_file="$3"
-  shift 3
-
-  local progress_pipe="$TEMP_DIR/.ffprogress_$$"
-  rm -f "$progress_pipe"
-  mkfifo "$progress_pipe" 2>/dev/null || { rm -f "$progress_pipe"; touch "$progress_pipe"; }
-
-  ffmpeg "$@" \
-    -progress "$progress_pipe" \
-    -nostats -loglevel error \
-    -y "$output_file" &
-  local ffmpeg_pid=$!
-
-  draw_bar 0 "$label"
-
-  local pct=0 out_us
-  # Read progress lines from the pipe in a subshell; use a temp file to share pct
-  local pct_file="$TEMP_DIR/.ffpct_$$"
-  echo 0 > "$pct_file"
-  (
-    while IFS= read -r line; do
-      if [[ "$line" == out_time_us=* ]]; then
-        local val="${line#out_time_us=}"
-        if [[ "$val" =~ ^[0-9]+$ && "$duration_s" -gt 0 ]]; then
-          local p=$(( val / 10000 / duration_s ))
-          [[ $p -gt 100 ]] && p=100
-          echo "$p" > "$pct_file"
-        fi
-      fi
-    done < "$progress_pipe"
-  ) &
-  local reader_pid=$!
-
-  while kill -0 "$ffmpeg_pid" 2>/dev/null; do
-    pct=$(cat "$pct_file" 2>/dev/null || echo 0)
-    draw_bar "$pct" "$label"
-    sleep 0.3
-  done
-
-  wait "$ffmpeg_pid"
-  local exit_code=$?
-  wait "$reader_pid" 2>/dev/null
-  rm -f "$progress_pipe" "$pct_file"
-
-  if [[ $exit_code -eq 0 ]]; then
-    draw_bar 100 "$label"
-    printf "\n" >/dev/tty
-  else
-    printf "\r%-70s\r" " " >/dev/tty
-  fi
-  return $exit_code
-}
-
-get_duration() {
-  local file="$1"
-  local d
-  d=$(ffprobe -v error -show_entries format=duration \
-    -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null)
-  local secs="${d%.*}"
-  [[ "$secs" =~ ^[0-9]+$ && "$secs" -gt 0 ]] && echo "$secs" || echo 1
-}
-
-# Pick the most recently modified file under $1 that is newer than $2.
-# Usage: latest_in_dir DIR MARKER_FILE
-latest_in_dir() {
-  local dir="$1" marker="$2"
-  # -printf is GNU-only; use stat for Termux compatibility
-  find "$dir" -newer "$marker" -type f 2>/dev/null \
-    | while IFS= read -r f; do
-        printf '%s\t%s\n' "$(stat -c '%Y' "$f" 2>/dev/null)" "$f"
-      done \
-    | sort -rn | head -1 | cut -f2-
-}
-
-# ── Compression ──────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════
+#  COMPRESSION
+# ════════════════════════════════════════════════════════════
 compress_audio() {
   local input="$1"
   local output="${input%.*}_compressed.mp3"
@@ -382,7 +547,8 @@ compress_video() {
     5)
       ask "Target size in MB:"; local target_mb="$REPLY"
       local bitrate
-      bitrate=$(echo "scale=0; ($target_mb * 8192) / $duration - 128" | bc 2>/dev/null | grep -oE '^-?[0-9]+' | head -1)
+      bitrate=$(echo "scale=0; ($target_mb * 8192) / $duration - 128" | bc 2>/dev/null \
+                | grep -oE '^-?[0-9]+' | head -1)
       [[ -z "$bitrate" || "$bitrate" -lt 100 ]] && bitrate=100
       info "Targeting ~${target_mb}MB (video ${bitrate}k + audio 128k)..."
       ffmpeg_progress "$duration" "Compressing video" "$output" \
@@ -453,7 +619,9 @@ compress_image() {
   fi
 }
 
-# ── Download functions ────────────────────────────────────────
+# ════════════════════════════════════════════════════════════
+#  DOWNLOAD FUNCTIONS
+# ════════════════════════════════════════════════════════════
 
 download_audio() {
   local url="$1"
@@ -499,8 +667,6 @@ download_audio() {
   info "Downloading audio as ${fmt^^}..."
   echo ""
 
-  # Send yt-dlp's normal progress/log to the tty, capture only the
-  # post-move filepath via --print on stdout.
   local out_file
   out_file=$(yt-dlp \
     --extract-audio \
@@ -518,21 +684,55 @@ download_audio() {
   if [[ -f "$out_file" ]]; then
     SUMMARY_FILE="$out_file"
     success "Saved: $out_file ($(human_size "$out_file"))"
-    if confirm "Compress this audio file?"; then
-      compress_audio "$out_file"
-    fi
+    if confirm "Compress this audio file?"; then compress_audio "$out_file"; fi
   else
     out_file=$(find "$AUDIO_DIR" -name "*.${fmt}" -newer "$TEMP_DIR/.marker" 2>/dev/null | head -1)
     if [[ -f "$out_file" ]]; then
       SUMMARY_FILE="$out_file"
       success "Saved: $out_file ($(human_size "$out_file"))"
-      if confirm "Compress this audio file?"; then
-        compress_audio "$out_file"
-      fi
+      if confirm "Compress this audio file?"; then compress_audio "$out_file"; fi
     else
       error "Audio download failed. Check the URL and try again."
     fi
   fi
+}
+
+# ── fetch_formats: yt-dlp -F with timeout & error capture ────
+# The root cause of the "stuck" bug:
+#   yt-dlp -F run inside $() swallows stderr (errors/warnings) and
+#   has no timeout — on Facebook share links it can hang indefinitely
+#   because yt-dlp follows redirects, hits login walls, then retries.
+#
+# Fix: run yt-dlp -F with a 30s timeout, show stderr live on tty,
+#   and only capture stdout (the format table).
+fetch_formats() {
+  local url="$1"
+  local fmt_list_file="$TEMP_DIR/.fmtlist_$$"
+  local fmt_err_file="$TEMP_DIR/.fmterr_$$"
+
+  info "Fetching available formats (30s timeout)..."
+  echo ""
+
+  # Run yt-dlp with a timeout; stdout → file, stderr → tty so user sees errors
+  timeout 30 yt-dlp -F "$url" \
+    --no-warnings \
+    >"$fmt_list_file" \
+    2>/dev/tty
+  local exit_code=$?
+
+  if [[ $exit_code -eq 124 ]]; then
+    error "Timed out fetching formats. The site may require login or is slow."
+    rm -f "$fmt_list_file"
+    return 1
+  elif [[ $exit_code -ne 0 ]]; then
+    warn "Could not fetch format list (exit $exit_code). Proceeding with quality presets only."
+    rm -f "$fmt_list_file"
+    return 1
+  fi
+
+  cat "$fmt_list_file"
+  rm -f "$fmt_list_file"
+  return 0
 }
 
 download_video() {
@@ -540,15 +740,23 @@ download_video() {
   print_section "Video Download"
   SUMMARY_TYPE="🎬 Video"
 
-  spinner_start "Fetching available formats"
+  # ── Format listing (no spinner — output goes to tty live) ──
   local fmt_list
-  fmt_list=$(yt-dlp -F "$url" 2>/dev/null)
-  spinner_stop "Formats ready"
+  fmt_list=$(fetch_formats "$url")
+  local fetch_ok=$?
 
-  echo ""
-  echo "$fmt_list" | grep -E "^[0-9]|ID |---"
-  echo ""
+  if [[ $fetch_ok -eq 0 && -n "$fmt_list" ]]; then
+    echo ""
+    echo "$fmt_list" | grep -E "^[0-9]|ID |---"
+    echo ""
+    success "Format list loaded"
+  else
+    echo ""
+    warn "Skipping format table — using quality presets."
+  fi
 
+  # ── Quality selection ──────────────────────────────────────
+  echo ""
   echo -e "  ${BOLD}Quick quality select:${RESET}"
   echo -e "  ${BOLD}1)${RESET} Best quality (video+audio)"
   echo -e "  ${BOLD}2)${RESET} 1080p"
@@ -572,12 +780,13 @@ download_video() {
     *) format_arg="bestvideo+bestaudio/best" ;;
   esac
 
+  # ── Container ─────────────────────────────────────────────
   echo ""
   echo -e "  ${BOLD}Output container:${RESET}"
   echo -e "  ${BOLD}1)${RESET} MP4 (recommended)"
   echo -e "  ${BOLD}2)${RESET} MKV"
   echo -e "  ${BOLD}3)${RESET} WEBM"
-  echo -e "  ${BOLD}4)${RESET} Let yt-dlp decide (default container)"
+  echo -e "  ${BOLD}4)${RESET} Let yt-dlp decide"
   ask "Choose container [1-4]:"
   local cont_choice="$REPLY"
   local merge_fmt
@@ -607,7 +816,6 @@ download_video() {
   echo ""
   local out_file
   out_file=$(latest_in_dir "$VIDEO_DIR" "$TEMP_DIR/.marker")
-  # Fallback: pick any file newer than marker
   if [[ -z "$out_file" || ! -f "$out_file" ]]; then
     out_file=$(find "$VIDEO_DIR" -newer "$TEMP_DIR/.marker" -type f 2>/dev/null | head -1)
   fi
@@ -615,9 +823,7 @@ download_video() {
   if [[ $exit_code -eq 0 && -f "$out_file" ]]; then
     SUMMARY_FILE="$out_file"
     success "Saved: $out_file ($(human_size "$out_file"))"
-    if confirm "Compress this video?"; then
-      compress_video "$out_file"
-    fi
+    if confirm "Compress this video?"; then compress_video "$out_file"; fi
   else
     error "Video download failed. Check the URL or format code."
   fi
@@ -672,9 +878,7 @@ download_image() {
         if confirm "Compress downloaded images?"; then
           find "$IMAGE_DIR" -newer "$TEMP_DIR/.marker" -type f \
             \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" -o -iname "*.webp" \) | \
-            while read -r img; do
-              compress_image "$img"
-            done
+            while read -r img; do compress_image "$img"; done
         fi
       else
         error "No images downloaded."
@@ -700,9 +904,7 @@ download_image() {
     echo ""
     SUMMARY_FILE="$IMAGE_DIR/$filename"
     success "Saved: $IMAGE_DIR/$filename ($(human_size "$IMAGE_DIR/$filename"))"
-    if confirm "Compress this image?"; then
-      compress_image "$IMAGE_DIR/$filename"
-    fi
+    if confirm "Compress this image?"; then compress_image "$IMAGE_DIR/$filename"; fi
   else
     error "Image download failed."
   fi
@@ -736,16 +938,12 @@ download_file() {
       ;;
     2)
       info "Downloading with wget..."
-      # Use -c for resume support; output goes to the current directory
-      # then we move it. Using --content-disposition for proper filename.
       wget -q --show-progress -c -O "$out_path" "$url"
       ;;
     3)
       info "Downloading with yt-dlp..."
       touch "$TEMP_DIR/.marker"
       yt-dlp --output "$FILE_DIR/%(title)s.%(ext)s" --newline "$url"
-      local _yt_exit=$?
-      # Override out_path with the actual downloaded file
       local _yt_file
       _yt_file=$(latest_in_dir "$FILE_DIR" "$TEMP_DIR/.marker")
       [[ -f "$_yt_file" ]] && out_path="$_yt_file"
@@ -764,12 +962,12 @@ download_file() {
     if [[ -f "$out_path" ]]; then
       SUMMARY_FILE="$out_path"
       info "Saved: $out_path ($(human_size "$out_path"))"
-      local ext="${filename##*.}"
-      if echo "$ext" | grep -qiE "^(mp4|mkv|avi|mov|webm|flv)$"; then
+      local ext_check="${out_path##*.}"
+      if echo "$ext_check" | grep -qiE "^(mp4|mkv|avi|mov|webm|flv)$"; then
         if confirm "Compress this video file?"; then compress_video "$out_path"; fi
-      elif echo "$ext" | grep -qiE "^(mp3|m4a|aac|wav|flac|ogg)$"; then
+      elif echo "$ext_check" | grep -qiE "^(mp3|m4a|aac|wav|flac|ogg)$"; then
         if confirm "Compress this audio file?"; then compress_audio "$out_path"; fi
-      elif echo "$ext" | grep -qiE "^(jpg|jpeg|png|webp|bmp)$"; then
+      elif echo "$ext_check" | grep -qiE "^(jpg|jpeg|png|webp|bmp)$"; then
         if confirm "Compress this image?"; then compress_image "$out_path"; fi
       fi
     fi
@@ -778,14 +976,32 @@ download_file() {
   fi
 }
 
-# ── Main ─────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════
+#  MAIN
+# ════════════════════════════════════════════════════════════
 main() {
   clear
   print_banner
 
+  # ── Pre-flight: version check option ──────────────────────
+  if [[ "${1:-}" == "--check-updates" || "${1:-}" == "--update" ]]; then
+    setup_storage
+    make_dirs
+    check_deps
+    check_versions
+    exit 0
+  fi
+
   local url="${1:-}"
   if [[ -z "$url" ]]; then
-    ask "Enter URL to download:"
+    ask "Enter URL to download (or 'u' to check for updates):"
+    if [[ "$REPLY" == "u" || "$REPLY" == "U" ]]; then
+      setup_storage
+      make_dirs
+      check_deps
+      check_versions
+      exit 0
+    fi
     url="$REPLY"
   fi
 
@@ -800,7 +1016,7 @@ main() {
   make_dirs
   check_deps
 
-  # Reset summary tracking for this run
+  # Reset summary
   SUMMARY_FILE=""
   SUMMARY_COMPRESSED=""
   SUMMARY_TYPE=""
@@ -828,7 +1044,6 @@ main() {
       ;;
   esac
 
-  # Show summary and wait for keypress before closing
   print_summary
 }
 
