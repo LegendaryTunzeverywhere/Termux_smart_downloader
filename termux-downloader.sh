@@ -28,6 +28,23 @@ SUMMARY_COMPRESSED=""
 SUMMARY_TYPE=""
 SUMMARY_START_TIME=""
 
+# ── Cleanup on exit / interrupt ──────────────────────────────
+SPINNER_PID=""
+cleanup() {
+  if [[ -n "$SPINNER_PID" ]] && kill -0 "$SPINNER_PID" 2>/dev/null; then
+    kill "$SPINNER_PID" 2>/dev/null
+  fi
+  # Clear any leftover spinner line on the tty
+  [[ -t 1 ]] && printf "\r%-70s\r" " " >/dev/tty 2>/dev/null
+}
+on_interrupt() {
+  cleanup
+  echo "" >/dev/tty 2>/dev/null
+  exit 130
+}
+trap cleanup EXIT
+trap on_interrupt INT TERM
+
 # ── Helpers ──────────────────────────────────────────────────
 print_banner() {
   echo -e "${CYAN}${BOLD}"
@@ -113,10 +130,21 @@ check_deps() {
 }
 
 setup_storage() {
-  if [[ ! -d "$HOME/storage" ]]; then
-    warn "Storage not set up. Running termux-setup-storage..."
+  if [[ ! -d "$HOME/storage/downloads" ]]; then
+    warn "Termux storage permission not set up yet."
+    info "Running termux-setup-storage. Tap ALLOW on the Android permission dialog."
     termux-setup-storage
-    sleep 2
+    # Poll for up to 60s while user grants permission
+    local i=0
+    while (( i < 60 )) && [[ ! -d "$HOME/storage/downloads" ]]; do
+      sleep 1
+      i=$(( i + 1 ))
+    done
+    if [[ ! -d "$HOME/storage/downloads" ]]; then
+      error "Storage was not granted. Run 'termux-setup-storage', allow access, then re-run."
+      exit 1
+    fi
+    success "Storage permission granted."
   fi
 }
 
@@ -172,7 +200,6 @@ print_summary() {
 }
 
 # ── Progress Utilities ────────────────────────────────────────
-SPINNER_PID=""
 
 spinner_start() {
   local label="$1"
@@ -186,7 +213,6 @@ spinner_start() {
     done
   ) &
   SPINNER_PID=$!
-  disown "$SPINNER_PID" 2>/dev/null
 }
 
 spinner_stop() {
@@ -263,6 +289,14 @@ get_duration() {
     -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null)
   local secs="${d%.*}"
   [[ "$secs" =~ ^[0-9]+$ && "$secs" -gt 0 ]] && echo "$secs" || echo 1
+}
+
+# Pick the most recently modified file under $1 that is newer than $2.
+# Usage: latest_in_dir DIR MARKER_FILE
+latest_in_dir() {
+  local dir="$1" marker="$2"
+  find "$dir" -newer "$marker" -type f -printf '%T@\t%p\n' 2>/dev/null \
+    | sort -rn | head -1 | cut -f2-
 }
 
 # ── Compression ──────────────────────────────────────────────
@@ -442,6 +476,8 @@ download_audio() {
   info "Downloading audio as ${fmt^^}..."
   echo ""
 
+  # Send yt-dlp's normal progress/log to the tty, capture only the
+  # post-move filepath via --print on stdout.
   local out_file
   out_file=$(yt-dlp \
     --extract-audio \
@@ -450,9 +486,10 @@ download_audio() {
     --output "$AUDIO_DIR/%(title)s.%(ext)s" \
     --print after_move:filepath \
     --newline \
-    "$url" 2>&1 | tee /dev/tty | grep -v '^\[' | grep -v '^$' | tail -1)
+    --no-warnings \
+    "$url" 2>/dev/tty)
 
-  out_file=$(printf '%s' "$out_file" | sed 's/\x1b\[[0-9;]*[mK]//g' | tr -d '\r' | xargs 2>/dev/null)
+  out_file=$(printf '%s' "$out_file" | tr -d '\r' | tail -1 | xargs 2>/dev/null)
 
   echo ""
   if [[ -f "$out_file" ]]; then
@@ -517,7 +554,7 @@ download_video() {
   echo -e "  ${BOLD}1)${RESET} MP4 (recommended)"
   echo -e "  ${BOLD}2)${RESET} MKV"
   echo -e "  ${BOLD}3)${RESET} WEBM"
-  echo -e "  ${BOLD}4)${RESET} Original (no remux)"
+  echo -e "  ${BOLD}4)${RESET} Let yt-dlp decide (default container)"
   ask "Choose container [1-4]:"
   local cont_choice="$REPLY"
   local merge_fmt
@@ -546,7 +583,7 @@ download_video() {
   local exit_code=$?
   echo ""
   local out_file
-  out_file=$(find "$VIDEO_DIR" -newer "$TEMP_DIR/.marker" -type f 2>/dev/null | head -1)
+  out_file=$(latest_in_dir "$VIDEO_DIR" "$TEMP_DIR/.marker")
 
   if [[ $exit_code -eq 0 && -f "$out_file" ]]; then
     SUMMARY_FILE="$out_file"
@@ -578,17 +615,15 @@ download_image() {
     if [[ "$g_choice" == "1" ]]; then
       echo ""
       echo -e "  ${BOLD}Quality/Size preference:${RESET}"
-      echo -e "  ${BOLD}1)${RESET} Best available"
-      echo -e "  ${BOLD}2)${RESET} Medium (re-encoded to 720p)"
-      echo -e "  ${BOLD}3)${RESET} Thumbnail only"
-      ask "Choose quality [1-3]:"
+      echo -e "  ${BOLD}1)${RESET} Best available (full resolution)"
+      echo -e "  ${BOLD}2)${RESET} Thumbnails only (smallest, fastest)"
+      ask "Choose quality [1-2]:"
       local img_q="$REPLY"
 
       local extra_args=()
       case "$img_q" in
         1) extra_args=() ;;
-        2) extra_args=(--format "bestvideo[height<=720]+bestaudio/best[height<=720]") ;;
-        3) extra_args=(--write-thumbnail --skip-download) ;;
+        2) extra_args=(--write-thumbnail --skip-download) ;;
         *) extra_args=() ;;
       esac
 
@@ -603,7 +638,7 @@ download_image() {
 
       echo ""
       local out_file
-      out_file=$(find "$IMAGE_DIR" -newer "$TEMP_DIR/.marker" -type f 2>/dev/null | head -1)
+      out_file=$(latest_in_dir "$IMAGE_DIR" "$TEMP_DIR/.marker")
       if [[ -f "$out_file" ]]; then
         SUMMARY_FILE="$IMAGE_DIR"
         success "Images saved to: $IMAGE_DIR"
@@ -674,7 +709,8 @@ download_file() {
       ;;
     2)
       info "Downloading with wget..."
-      wget -c --show-progress -O "$out_path" "$url"
+      # Note: -c (resume) is incompatible with -O; -O always truncates.
+      wget --show-progress -O "$out_path" "$url"
       ;;
     3)
       info "Downloading with yt-dlp..."
