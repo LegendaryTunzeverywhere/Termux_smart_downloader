@@ -158,7 +158,9 @@ human_size() {
 }
 
 elapsed_time() {
-  local secs=$(( $(date +%s) - SUMMARY_START_TIME ))
+  local start="${SUMMARY_START_TIME:-0}"
+  local secs=$(( $(date +%s) - start ))
+  [[ $secs -lt 0 ]] && secs=0
   if [[ $secs -lt 60 ]]; then
     echo "${secs}s"
   else
@@ -246,6 +248,7 @@ ffmpeg_progress() {
 
   local progress_pipe="$TEMP_DIR/.ffprogress_$$"
   rm -f "$progress_pipe"
+  mkfifo "$progress_pipe" 2>/dev/null || { rm -f "$progress_pipe"; touch "$progress_pipe"; }
 
   ffmpeg "$@" \
     -progress "$progress_pipe" \
@@ -255,23 +258,34 @@ ffmpeg_progress() {
 
   draw_bar 0 "$label"
 
-  local pct=0
-  while kill -0 "$ffmpeg_pid" 2>/dev/null; do
-    if [[ -f "$progress_pipe" ]]; then
-      local out_us
-      out_us=$(grep '^out_time_us=' "$progress_pipe" 2>/dev/null | tail -1 | cut -d= -f2)
-      if [[ -n "$out_us" && "$out_us" =~ ^[0-9]+$ && "$duration_s" -gt 0 ]]; then
-        pct=$(( out_us / 10000 / duration_s ))
-        [[ $pct -gt 100 ]] && pct=100
-        draw_bar "$pct" "$label"
+  local pct=0 out_us
+  # Read progress lines from the pipe in a subshell; use a temp file to share pct
+  local pct_file="$TEMP_DIR/.ffpct_$$"
+  echo 0 > "$pct_file"
+  (
+    while IFS= read -r line; do
+      if [[ "$line" == out_time_us=* ]]; then
+        local val="${line#out_time_us=}"
+        if [[ "$val" =~ ^[0-9]+$ && "$duration_s" -gt 0 ]]; then
+          local p=$(( val / 10000 / duration_s ))
+          [[ $p -gt 100 ]] && p=100
+          echo "$p" > "$pct_file"
+        fi
       fi
-    fi
+    done < "$progress_pipe"
+  ) &
+  local reader_pid=$!
+
+  while kill -0 "$ffmpeg_pid" 2>/dev/null; do
+    pct=$(cat "$pct_file" 2>/dev/null || echo 0)
+    draw_bar "$pct" "$label"
     sleep 0.3
   done
 
   wait "$ffmpeg_pid"
   local exit_code=$?
-  rm -f "$progress_pipe"
+  wait "$reader_pid" 2>/dev/null
+  rm -f "$progress_pipe" "$pct_file"
 
   if [[ $exit_code -eq 0 ]]; then
     draw_bar 100 "$label"
@@ -295,7 +309,11 @@ get_duration() {
 # Usage: latest_in_dir DIR MARKER_FILE
 latest_in_dir() {
   local dir="$1" marker="$2"
-  find "$dir" -newer "$marker" -type f -printf '%T@\t%p\n' 2>/dev/null \
+  # -printf is GNU-only; use stat for Termux compatibility
+  find "$dir" -newer "$marker" -type f 2>/dev/null \
+    | while IFS= read -r f; do
+        printf '%s\t%s\n' "$(stat -c '%Y' "$f" 2>/dev/null)" "$f"
+      done \
     | sort -rn | head -1 | cut -f2-
 }
 
@@ -364,8 +382,8 @@ compress_video() {
     5)
       ask "Target size in MB:"; local target_mb="$REPLY"
       local bitrate
-      bitrate=$(echo "scale=0; ($target_mb * 8192) / $duration - 128" | bc)
-      [[ "$bitrate" -lt 100 ]] && bitrate=100
+      bitrate=$(echo "scale=0; ($target_mb * 8192) / $duration - 128" | bc 2>/dev/null | grep -oE '^-?[0-9]+' | head -1)
+      [[ -z "$bitrate" || "$bitrate" -lt 100 ]] && bitrate=100
       info "Targeting ~${target_mb}MB (video ${bitrate}k + audio 128k)..."
       ffmpeg_progress "$duration" "Compressing video" "$output" \
         -i "$input" -b:v "${bitrate}k" -bufsize "${bitrate}k" \
@@ -407,17 +425,22 @@ compress_image() {
   ask "Choose compression level [1-4]:"
   local choice="$REPLY"
 
-  local quality
+  local quality_pct qscale
   case "$choice" in
-    1) quality=40 ;;
-    2) quality=65 ;;
-    3) quality=85 ;;
-    4) ask "Enter quality [1-100]:"; quality="$REPLY" ;;
+    1) quality_pct=40 ;;
+    2) quality_pct=65 ;;
+    3) quality_pct=85 ;;
+    4) ask "Enter quality [1-100]:"; quality_pct="$REPLY" ;;
     *) warn "Invalid choice, skipping compression."; return ;;
   esac
 
+  # ffmpeg mjpeg qscale: 2 (best) ... 31 (worst). Map user 1-100 -> 31-2.
+  qscale=$(( 31 - ( quality_pct * 29 / 100 ) ))
+  [[ $qscale -lt 2  ]] && qscale=2
+  [[ $qscale -gt 31 ]] && qscale=31
+
   spinner_start "Compressing image"
-  ffmpeg -i "$input" -q:v "$quality" -y "$output" 2>/dev/null
+  ffmpeg -i "$input" -qscale:v "$qscale" -y "$output" 2>/dev/null
   local exit_code=$?
   spinner_stop "Image compressed"
 
@@ -584,6 +607,10 @@ download_video() {
   echo ""
   local out_file
   out_file=$(latest_in_dir "$VIDEO_DIR" "$TEMP_DIR/.marker")
+  # Fallback: pick any file newer than marker
+  if [[ -z "$out_file" || ! -f "$out_file" ]]; then
+    out_file=$(find "$VIDEO_DIR" -newer "$TEMP_DIR/.marker" -type f 2>/dev/null | head -1)
+  fi
 
   if [[ $exit_code -eq 0 && -f "$out_file" ]]; then
     SUMMARY_FILE="$out_file"
@@ -709,12 +736,19 @@ download_file() {
       ;;
     2)
       info "Downloading with wget..."
-      # Note: -c (resume) is incompatible with -O; -O always truncates.
-      wget --show-progress -O "$out_path" "$url"
+      # Use -c for resume support; output goes to the current directory
+      # then we move it. Using --content-disposition for proper filename.
+      wget -q --show-progress -c -O "$out_path" "$url"
       ;;
     3)
       info "Downloading with yt-dlp..."
+      touch "$TEMP_DIR/.marker"
       yt-dlp --output "$FILE_DIR/%(title)s.%(ext)s" --newline "$url"
+      local _yt_exit=$?
+      # Override out_path with the actual downloaded file
+      local _yt_file
+      _yt_file=$(latest_in_dir "$FILE_DIR" "$TEMP_DIR/.marker")
+      [[ -f "$_yt_file" ]] && out_path="$_yt_file"
       ;;
     *)
       info "Downloading with curl..."
